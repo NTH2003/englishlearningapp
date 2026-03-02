@@ -7,12 +7,12 @@ import {
   SafeAreaView,
 } from 'react-native';
 import {useFocusEffect} from '@react-navigation/native';
-import {COLORS} from '../constants';
+import {COLORS} from '../../constants';
 import {
   getAllVocabulary,
   isWordLearned,
-} from '../services/vocabularyService';
-import {getLearningProgress} from '../services/storageService';
+} from '../../services/vocabularyService';
+import {getLearningProgress} from '../../services/storageService';
 
 const TOPICS = [
   {

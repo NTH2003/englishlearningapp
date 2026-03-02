@@ -11,8 +11,8 @@ import {
   Platform,
 } from 'react-native';
 import {useNavigation, useRoute} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {getDialogueById} from '../data/dialogueData';
+import {COLORS} from '../../constants';
+import {getDialogueById} from '../../data/dialogueData';
 
 const DialoguePracticeScreen = () => {
   const navigation = useNavigation();

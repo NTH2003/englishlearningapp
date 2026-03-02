@@ -5,12 +5,12 @@ import {
   StyleSheet,
   ScrollView,
 } from 'react-native';
-import {COLORS} from '../constants';
+import {COLORS} from '../../constants';
 import {
   getLessonById,
   getAllVocabulary,
   isWordLearned,
-} from '../services/vocabularyService';
+} from '../../services/vocabularyService';
 
 const LessonDetailScreen = ({route}) => {
   const lessonId = route?.params?.lessonId;

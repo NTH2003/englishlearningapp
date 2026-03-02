@@ -1,10 +1,3 @@
-// App Constants
-export const APP_NAME = 'English Learning App';
-export const APP_VERSION = '0.0.1';
-
-// API Constants (sẽ cập nhật sau)
-export const API_BASE_URL = 'https://api.example.com';
-
 // Storage Keys
 export const STORAGE_KEYS = {
   USER_DATA: '@user_data',
@@ -39,9 +32,8 @@ export const COLORS = {
   CARD_SHADOW: '#00000010',
 };
 
-// Learning Levels
-export const LEARNING_LEVELS = {
-  BEGINNER: 'beginner',
-  INTERMEDIATE: 'intermediate',
-  ADVANCED: 'advanced',
+// Cloudinary config (public values only)
+export const CLOUDINARY = {
+  CLOUD_NAME: 'dkblwkrw7',
+  UPLOAD_PRESET: 'english_app',
 };

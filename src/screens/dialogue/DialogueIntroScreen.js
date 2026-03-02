@@ -9,8 +9,8 @@ import {
   Image,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {dialogueScenarios} from '../data/dialogueData';
+import {COLORS} from '../../constants';
+import {dialogueScenarios} from '../../data/dialogueData';
 
 const DialogueIntroScreen = () => {
   const navigation = useNavigation();

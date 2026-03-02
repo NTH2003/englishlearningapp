@@ -256,28 +256,3 @@ export const lessonsData = [
     description: 'Học từ vựng về sức khỏe',
   },
 ];
-
-// Dữ liệu bài nghe
-export const listeningData = [
-  {
-    id: 1,
-    title: 'Giao tiếp hàng ngày',
-    level: 'Sơ cấp',
-    duration: '5 phút',
-    description: 'Luyện nghe các đoạn hội thoại hàng ngày',
-  },
-  {
-    id: 2,
-    title: 'Du lịch và khám phá',
-    level: 'Trung cấp',
-    duration: '8 phút',
-    description: 'Nghe về các chủ đề du lịch',
-  },
-  {
-    id: 3,
-    title: 'Công việc và nghề nghiệp',
-    level: 'Nâng cao',
-    duration: '10 phút',
-    description: 'Luyện nghe về môi trường làm việc',
-  },
-];

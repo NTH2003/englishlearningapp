@@ -1,4 +1,4 @@
-import React, {useState, useEffect} from 'react';
+import React, {useState, useCallback} from 'react';
 import {
   View,
   Text,
@@ -6,31 +6,36 @@ import {
   TouchableOpacity,
   StyleSheet,
   SafeAreaView,
-  Dimensions,
 } from 'react-native';
 import {useNavigation, useFocusEffect} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {clearAllData, getLearningProgress} from '../services/storageService';
-import {getLearnedWordsCount} from '../services/vocabularyService';
+import {COLORS} from '../../constants';
+import {clearAllData, getLearningProgress} from '../../services/storageService';
+import {getLearnedWordsCount} from '../../services/vocabularyService';
 
-const { width } = Dimensions.get("window")
+function getAuthService() {
+  try {
+    return require('../../services/firebaseService');
+  } catch (_) {
+    return null;
+  }
+}
 
 const HomeScreen = () => {
   const navigation = useNavigation();
-  const [selectedFeature, setSelectedFeature] = useState(null)
-  const [showProfileMenu, setShowProfileMenu] = useState(false)
-  
-  // Tên người dùng (sẽ lấy từ storage hoặc API sau)
-  const [userName] = useState('Người dùng')
+  const [selectedFeature, setSelectedFeature] = useState(null);
+  const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const [userName, setUserName] = useState('Người dùng');
+  const [isAdminUser, setIsAdminUser] = useState(false);
 
   // Hàm xử lý đăng xuất
-  const handleLogout = async () => {
+  const handleLogout = useCallback(async () => {
     setShowProfileMenu(false);
-    // Xóa tất cả dữ liệu đã lưu
+    const auth = getAuthService();
+    if (auth) {
+      await auth.signOut();
+    }
     await clearAllData();
-    // TODO: Navigate to Login screen khi có màn hình đăng nhập
-    console.log('Đã đăng xuất');
-  }
+  }, []);
 
   // Hàm điều hướng đến các màn hình tính năng
   const navigateToFeature = (featureId) => {
@@ -52,11 +57,21 @@ const HomeScreen = () => {
     level: "Sơ cấp",
   })
 
-  // Load tiến độ học tập từ storage
+  // Load tiến độ học tập từ storage + cập nhật tên user
   useFocusEffect(
     React.useCallback(() => {
       loadProgress();
-    }, [])
+      const auth = getAuthService();
+      const user = auth ? auth.getCurrentUser() : null;
+      const canAccessAdmin = auth?.isCurrentUserAdmin ? auth.isCurrentUserAdmin() : false;
+      setIsAdminUser(Boolean(canAccessAdmin));
+      if (user && !user.isAnonymous && user.email) {
+        const shortName = user.email.split('@')[0] || 'Người dùng';
+        setUserName(shortName);
+      } else {
+        setUserName('Người dùng');
+      }
+    }, []),
   );
 
   const loadProgress = async () => {
@@ -100,6 +115,23 @@ const HomeScreen = () => {
     },
   ]
 
+  const totalXP = progress.totalXP || 0;
+  let levelMin = 0;
+  let levelMax = 100;
+  if (totalXP < 100) {
+    levelMin = 0;
+    levelMax = 100;
+  } else if (totalXP < 300) {
+    levelMin = 100;
+    levelMax = 300;
+  } else {
+    levelMin = 300;
+    levelMax = 600;
+  }
+  const levelRange = levelMax - levelMin || 1;
+  const inLevelXP = Math.min(Math.max(totalXP - levelMin, 0), levelRange);
+  const levelProgressPercent = Math.round((inLevelXP / levelRange) * 100);
+
   return (
     <SafeAreaView style={styles.container}>
       <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false} bounces={true}>
@@ -129,6 +161,21 @@ const HomeScreen = () => {
                       <Text style={styles.profileMenuText}>Hồ sơ</Text>
                     </TouchableOpacity>
                     <View style={styles.profileMenuDivider} />
+                    {isAdminUser && (
+                      <>
+                        <TouchableOpacity
+                          style={styles.profileMenuItem}
+                          onPress={() => {
+                            setShowProfileMenu(false)
+                            navigation.navigate('Admin')
+                          }}
+                          activeOpacity={0.7}>
+                          <Text style={styles.profileMenuIcon}>🛠️</Text>
+                          <Text style={styles.profileMenuText}>Quản trị dữ liệu</Text>
+                        </TouchableOpacity>
+                        <View style={styles.profileMenuDivider} />
+                      </>
+                    )}
                     <TouchableOpacity
                       style={styles.profileMenuItem}
                       onPress={handleLogout}
@@ -162,13 +209,23 @@ const HomeScreen = () => {
             </View>
           </View>
 
-          <View style={[styles.levelBadge, {backgroundColor: COLORS.PRIMARY_DARK}]}>
+          <View style={[styles.levelBadge, {backgroundColor: COLORS.BACKGROUND}]}>
             <View style={styles.levelBadgeContent}>
               <Text style={styles.levelLabel}>Cấp độ hiện tại</Text>
-              <Text style={styles.levelValue}>{progress.level}</Text>
-            </View>
-            <View style={styles.progressCircle}>
-              <Text style={styles.progressPercent}>68%</Text>
+              <Text style={styles.levelValue}>{progress.level || 'Sơ cấp'}</Text>
+              <View style={styles.levelXpRow}>
+                <View style={styles.levelXpBarBackground}>
+                  <View
+                    style={[
+                      styles.levelXpBarFill,
+                      {width: `${levelProgressPercent}%`},
+                    ]}
+                  />
+                </View>
+                <Text style={styles.levelXpText}>
+                  {progress.totalXP || 0} XP
+                </Text>
+              </View>
             </View>
           </View>
 
@@ -185,6 +242,20 @@ const HomeScreen = () => {
               </Text>
             </View>
           </TouchableOpacity>
+
+          {/* Nút xem từ yêu thích */}
+          <TouchableOpacity
+            style={styles.learningPathButton}
+            activeOpacity={0.8}
+            onPress={() => navigation.navigate('MyVocabulary')}>
+            <Text style={styles.learningPathIcon}>★</Text>
+            <View style={styles.learningPathTextWrapper}>
+              <Text style={styles.learningPathTitle}>Từ vựng của tôi</Text>
+              <Text style={styles.learningPathSubtitle}>
+                Xem danh sách từ đã yêu thích
+              </Text>
+            </View>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.section}>
@@ -196,7 +267,9 @@ const HomeScreen = () => {
           </View>
 
           <View style={styles.featuresGrid}>
-            {features.map((feature) => (
+            {features.map((feature, index) => {
+              const isLastOdd = features.length % 2 === 1 && index === features.length - 1
+              return (
               <TouchableOpacity
                 key={feature.id}
                 onPress={() => {
@@ -204,15 +277,35 @@ const HomeScreen = () => {
                   navigateToFeature(feature.id);
                 }}
                 activeOpacity={0.8}
-                style={[styles.featureCardWrapper, selectedFeature === feature.id && styles.featureCardActive]}
+                style={[
+                  styles.featureCardWrapper,
+                  isLastOdd && styles.featureCardWrapperLastOdd,
+                  selectedFeature === feature.id && styles.featureCardActive,
+                ]}
               >
-                <View style={[styles.featureCard, {backgroundColor: feature.color}]}>
+                <View
+                  style={[
+                    styles.featureCard,
+                    isLastOdd && styles.featureCardLastOdd,
+                    {backgroundColor: feature.color},
+                  ]}>
                   <Text style={styles.featureIcon}>{feature.icon}</Text>
-                  <Text style={styles.featureTitle}>{feature.title}</Text>
-                  <Text style={styles.featureDescription}>{feature.description}</Text>
+                  <Text
+                    style={styles.featureTitle}
+                    numberOfLines={1}
+                    ellipsizeMode="tail">
+                    {feature.title}
+                  </Text>
+                  <Text
+                    style={styles.featureDescription}
+                    numberOfLines={2}
+                    ellipsizeMode="tail">
+                    {feature.description}
+                  </Text>
                 </View>
               </TouchableOpacity>
-            ))}
+              )
+            })}
           </View>
         </View>
 
@@ -369,7 +462,7 @@ const styles = StyleSheet.create({
   },
   levelBadge: {
     flexDirection: "row",
-    justifyContent: "space-between",
+    justifyContent: "flex-start",
     alignItems: "center",
     borderRadius: 16,
     padding: 16,
@@ -384,14 +477,14 @@ const styles = StyleSheet.create({
   },
   levelLabel: {
     fontSize: 12,
-    color: "rgba(255, 255, 255, 0.85)",
+    color: COLORS.TEXT_SECONDARY,
     marginBottom: 4,
     fontWeight: "500",
   },
   levelValue: {
     fontSize: 20,
     fontWeight: "bold",
-    color: COLORS.BACKGROUND_WHITE,
+    color: COLORS.TEXT,
     marginBottom: 6,
   },
   streakText: {
@@ -400,19 +493,35 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
   progressCircle: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: "rgba(255, 255, 255, 0.25)",
-    justifyContent: "center",
-    alignItems: "center",
-    borderWidth: 2,
-    borderColor: "rgba(255, 255, 255, 0.4)",
+    display: 'none',
   },
   progressPercent: {
     fontSize: 16,
     fontWeight: "bold",
-    color: COLORS.BACKGROUND_WHITE,
+    color: COLORS.TEXT,
+  },
+  levelXpRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 8,
+    gap: 8,
+  },
+  levelXpBarBackground: {
+    flex: 1,
+    height: 6,
+    borderRadius: 999,
+    backgroundColor: COLORS.BORDER,
+    overflow: 'hidden',
+  },
+  levelXpBarFill: {
+    height: '100%',
+    backgroundColor: COLORS.PRIMARY_DARK,
+    borderRadius: 999,
+  },
+  levelXpText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: COLORS.TEXT_SECONDARY,
   },
   learningPathButton: {
     marginTop: 12,
@@ -475,6 +584,10 @@ const styles = StyleSheet.create({
     width: "48%",
     marginBottom: 12,
   },
+  featureCardWrapperLastOdd: {
+    width: "100%",
+    alignItems: "center",
+  },
   featureCardActive: {
     transform: [{ scale: 0.95 }],
   },
@@ -482,13 +595,16 @@ const styles = StyleSheet.create({
     borderRadius: 16,
     padding: 16,
     alignItems: "center",
-    minHeight: 140,
+    height: 150,
     justifyContent: "center",
     shadowColor: COLORS.TEXT,
     shadowOffset: { width: 0, height: 4 },
     shadowOpacity: 0.1,
     shadowRadius: 8,
     elevation: 4,
+  },
+  featureCardLastOdd: {
+    width: "48%",
   },
   featureIcon: {
     fontSize: 36,

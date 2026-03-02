@@ -4,19 +4,16 @@ import {
   Text,
   StyleSheet,
   TouchableOpacity,
+  Image,
   Animated,
   PanResponder,
   Dimensions,
   SafeAreaView,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {markWordAsLearned, isWordLearned} from '../services/vocabularyService';
-import {
-  addFavoriteWord,
-  removeFavoriteWord,
-  isFavoriteWord,
-} from '../services/storageService';
+import {COLORS} from '../../constants';
+import {markWordAsLearned, isWordLearned} from '../../services/vocabularyService';
+import {getWordMedia} from '../../services/firebaseService';
 
 const {width: SCREEN_WIDTH} = Dimensions.get('window');
 const SWIPE_THRESHOLD = 120;
@@ -25,13 +22,12 @@ const VocabularyFlashcardScreen = ({route}) => {
   const navigation = useNavigation();
   const {words, topicId} = route.params || {};
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [showExample, setShowExample] = useState(false);
   const [isFlipped, setIsFlipped] = useState(false);
   const [isLearned, setIsLearned] = useState(false);
   const [learnedWordsInSession, setLearnedWordsInSession] = useState(
     new Set(),
   );
-  const [isFavorite, setIsFavorite] = useState(false);
+  const [wordMedia, setWordMedia] = useState(null);
   
   const flipAnimation = useRef(new Animated.Value(0)).current;
   const position = useRef(new Animated.ValueXY()).current;
@@ -54,7 +50,6 @@ const VocabularyFlashcardScreen = ({route}) => {
 
   useEffect(() => {
     // Reset khi chuyển từ
-    setShowExample(false);
     setIsFlipped(false);
     flipAnimation.setValue(0);
     position.setValue({x: 0, y: 0});
@@ -65,8 +60,10 @@ const VocabularyFlashcardScreen = ({route}) => {
       if (currentWord) {
         const learned = await isWordLearned(currentWord.id);
         setIsLearned(learned);
-        const fav = await isFavoriteWord(currentWord.id);
-        setIsFavorite(fav);
+        const media = await getWordMedia(currentWord.id);
+        setWordMedia(media);
+      } else {
+        setWordMedia(null);
       }
     };
     syncStatuses();
@@ -145,40 +142,12 @@ const VocabularyFlashcardScreen = ({route}) => {
     await markWordAsLearned(currentWord.id, newLearnedStatus);
   };
 
-  const handleToggleFavorite = async () => {
-    if (!currentWord) {
-      return;
-    }
-    const next = !isFavorite;
-    setIsFavorite(next);
-    try {
-      if (next) {
-        await addFavoriteWord(currentWord.id);
-      } else {
-        await removeFavoriteWord(currentWord.id);
-      }
-    } catch (error) {
-      console.error('Error toggling favorite word:', error);
-    }
-  };
-
-  const getLevelText = (level) => {
-    const levelMap = {
-      'Beginner': 'Sơ cấp',
-      'Intermediate': 'Trung cấp',
-      'Advanced': 'Cao cấp',
-    };
-    return levelMap[level] || level;
-  };
-
-  const getCategoryText = (category) => {
-    const categoryMap = {
-      'Food': 'Thực phẩm',
-      'Travel': 'Du lịch',
-      'Daily Life': 'Cuộc sống hàng ngày',
-      'Technology': 'Công nghệ',
-    };
-    return categoryMap[category] || category;
+  const getWordImageSource = () => {
+    if (!currentWord) return null;
+    const image = wordMedia?.imageUrl || currentWord.image || currentWord.imageUri;
+    if (!image) return null;
+    if (typeof image === 'string') return {uri: image};
+    return image; // hỗ trợ require('...') nếu cần
   };
 
   const frontInterpolate = flipAnimation.interpolate({
@@ -225,11 +194,6 @@ const VocabularyFlashcardScreen = ({route}) => {
           <Text style={styles.backButtonText}>← Quay lại</Text>
         </TouchableOpacity>
         <View style={styles.headerRight}>
-          <View style={styles.statsContainer}>
-            <Text style={styles.statsText}>
-              ✓ {learnedWordsInSession.size} từ đã học
-            </Text>
-          </View>
           <Text style={styles.progressText}>
             {currentIndex + 1} / {words.length}
           </Text>
@@ -282,35 +246,21 @@ const VocabularyFlashcardScreen = ({route}) => {
             ]}>
             <View style={styles.cardContent}>
               <View style={styles.cardContentInner}>
-                {/* Word Info Badges + Favorite */}
-                <View style={styles.wordInfoRow}>
-                  <View style={styles.wordInfoContainer}>
-                    <View style={styles.badge}>
-                      <Text style={styles.badgeText}>
-                        {getLevelText(currentWord.level)}
-                      </Text>
-                    </View>
-                    <View style={[styles.badge, styles.badgeCategory]}>
-                      <Text style={styles.badgeText}>
-                        {getCategoryText(currentWord.category)}
-                      </Text>
-                    </View>
-                  </View>
-                  <TouchableOpacity
-                    style={styles.favoriteButton}
-                    onPress={handleToggleFavorite}
-                    activeOpacity={0.7}>
-                    <Text style={styles.favoriteIcon}>
-                      {isFavorite ? '★' : '☆'}
-                    </Text>
-                  </TouchableOpacity>
-                </View>
 
                 {/* Word Section tappable to flip */}
                 <TouchableOpacity
                   activeOpacity={1}
                   onPress={handleFlip}
                   style={styles.wordSectionTouchable}>
+                  {getWordImageSource() ? (
+                    <View style={styles.wordImageWrapper}>
+                      <Image
+                        source={getWordImageSource()}
+                        style={styles.wordImage}
+                        resizeMode="cover"
+                      />
+                    </View>
+                  ) : null}
                   <View style={styles.wordSection}>
                     <Text style={styles.wordText}>{currentWord.word}</Text>
                     <Text style={styles.pronunciationText}>
@@ -381,6 +331,7 @@ const VocabularyFlashcardScreen = ({route}) => {
             </View>
           </TouchableOpacity>
         </Animated.View>
+
       </View>
 
       {/* Navigation Buttons */}
@@ -434,14 +385,18 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
-    padding: 20,
+    paddingHorizontal: 20,
     paddingTop: 10,
+    paddingBottom: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: COLORS.BORDER,
   },
   backButton: {
-    padding: 8,
+    paddingVertical: 6,
+    paddingHorizontal: 4,
   },
   backButtonText: {
-    fontSize: 16,
+    fontSize: 15,
     color: COLORS.PRIMARY_DARK,
     fontWeight: '600',
   },
@@ -463,22 +418,23 @@ const styles = StyleSheet.create({
   },
   progressBarContainer: {
     paddingHorizontal: 20,
-    paddingBottom: 12,
+    paddingTop: 8,
+    paddingBottom: 16,
   },
   progressBarBackground: {
-    height: 8,
+    height: 6,
     backgroundColor: COLORS.BORDER,
-    borderRadius: 4,
+    borderRadius: 6,
     overflow: 'hidden',
-    marginBottom: 8,
+    marginBottom: 6,
   },
   progressBarFill: {
-    height: '100%',
+    height: 4,
     backgroundColor: COLORS.PRIMARY_DARK,
-    borderRadius: 4,
+    borderRadius: 6,
   },
   progressPercentage: {
-    fontSize: 12,
+    fontSize: 11,
     color: COLORS.TEXT_SECONDARY,
     textAlign: 'right',
     fontWeight: '600',
@@ -488,10 +444,11 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     paddingHorizontal: 20,
+    paddingBottom: 16,
   },
   cardWrapper: {
     width: SCREEN_WIDTH - 40,
-    height: 400,
+    height: 380,
   },
   card: {
     position: 'absolute',
@@ -501,7 +458,7 @@ const styles = StyleSheet.create({
   },
   cardFront: {
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 20,
+    borderRadius: 24,
     shadowColor: COLORS.TEXT,
     shadowOffset: {width: 0, height: 4},
     shadowOpacity: 0.2,
@@ -510,7 +467,7 @@ const styles = StyleSheet.create({
   },
   cardBack: {
     backgroundColor: COLORS.PRIMARY_SOFT,
-    borderRadius: 20,
+    borderRadius: 24,
     shadowColor: COLORS.TEXT,
     shadowOffset: {width: 0, height: 4},
     shadowOpacity: 0.2,
@@ -525,42 +482,22 @@ const styles = StyleSheet.create({
     flex: 1,
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 30,
+    padding: 26,
   },
-  wordInfoRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 20,
+  wordImageWrapper: {
+    width: 170,
+    height: 110,
+    borderRadius: 14,
+    overflow: 'hidden',
+    marginBottom: 18,
+    backgroundColor: COLORS.BORDER,
   },
-  wordInfoContainer: {
-    flexDirection: 'row',
-    gap: 8,
-  },
-  favoriteButton: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  favoriteIcon: {
-    fontSize: 24,
-    color: COLORS.PRIMARY_DARK,
-  },
-  badge: {
-    backgroundColor: COLORS.PRIMARY_DARK,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 12,
-  },
-  badgeCategory: {
-    backgroundColor: COLORS.PRIMARY,
-  },
-  badgeText: {
-    fontSize: 12,
-    color: COLORS.BACKGROUND_WHITE,
-    fontWeight: '600',
+  wordImage: {
+    width: '100%',
+    height: '100%',
   },
   wordSection: {
-    marginBottom: 24,
+    marginBottom: 20,
     width: '100%',
     alignItems: 'center',
   },
@@ -569,7 +506,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   wordText: {
-    fontSize: 42,
+    fontSize: 40,
     fontWeight: 'bold',
     color: COLORS.PRIMARY_DARK,
     marginBottom: 12,
@@ -666,14 +603,15 @@ const styles = StyleSheet.create({
   navigationContainer: {
     flexDirection: 'row',
     justifyContent: 'space-between',
-    padding: 20,
-    gap: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 16,
+    gap: 10,
   },
   navButton: {
     flex: 1,
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    paddingVertical: 16,
-    borderRadius: 12,
+    paddingVertical: 14,
+    borderRadius: 14,
     alignItems: 'center',
     borderWidth: 2,
     borderColor: COLORS.BORDER,

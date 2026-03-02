@@ -8,8 +8,8 @@ import {
   SafeAreaView,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {getAllVideos} from '../data/videoData';
+import {COLORS} from '../../constants';
+import {getAllVideos} from '../../data/videoData';
 
 // TOPICS giống với TopicSelectionScreen
 const TOPICS = [

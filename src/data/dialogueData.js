@@ -32,6 +32,3 @@ export const dialogueScenarios = [
 export const getDialogueById = id =>
   dialogueScenarios.find(dialogue => dialogue.id === id);
 
-export const getDialoguesByTopic = topicId =>
-  dialogueScenarios.filter(dialogue => dialogue.topicId === topicId);
-

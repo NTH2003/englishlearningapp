@@ -11,9 +11,9 @@ import {
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
 import Video from 'react-native-video';
-import {COLORS} from '../constants';
-import {getVocabularyByCategory} from '../services/vocabularyService';
-import {addVideoWatched} from '../services/storageService';
+import {COLORS} from '../../constants';
+import {getVocabularyByCategory} from '../../services/vocabularyService';
+import {addVideoWatched} from '../../services/storageService';
 
 // TOPICS giống với TopicSelectionScreen
 const TOPICS = [

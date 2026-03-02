@@ -1,6 +1,15 @@
 import {vocabularyData, lessonsData} from '../data/vocabularyData';
 import {getLearningProgress, saveLearningProgress} from './storageService';
 
+const XP_PER_NEW_WORD = 10;
+
+function computeLevelName(totalXP) {
+  const xp = Number(totalXP) || 0;
+  if (xp < 100) return 'Sơ cấp';
+  if (xp < 300) return 'Trung cấp';
+  return 'Nâng cao';
+}
+
 // Lấy tất cả từ vựng
 export const getAllVocabulary = () => {
   return vocabularyData;
@@ -10,19 +19,12 @@ export const getAllVocabulary = () => {
 export const getVocabularyById = (id) => {
   // Convert to number if needed
   const numId = typeof id === 'string' ? parseInt(id) : id;
-  const word = vocabularyData.find(word => word.id === numId);
-  console.log('getVocabularyById - Looking for ID:', numId, 'Found:', word);
-  return word;
+  return vocabularyData.find(word => word.id === numId);
 };
 
 // Lấy từ vựng theo chủ đề
 export const getVocabularyByCategory = (category) => {
   return vocabularyData.filter(word => word.category === category);
-};
-
-// Lấy từ vựng theo cấp độ
-export const getVocabularyByLevel = (level) => {
-  return vocabularyData.filter(word => word.level === level);
 };
 
 // Đánh dấu từ đã học
@@ -34,6 +36,10 @@ export const markWordAsLearned = async (wordId, learned = true) => {
       lessonsCompleted: [],
     };
 
+    const alreadyLearned =
+      Array.isArray(updatedProgress.wordsLearned) &&
+      updatedProgress.wordsLearned.includes(wordId);
+
     if (learned) {
       if (!updatedProgress.wordsLearned.includes(wordId)) {
         updatedProgress.wordsLearned.push(wordId);
@@ -43,6 +49,14 @@ export const markWordAsLearned = async (wordId, learned = true) => {
         id => id !== wordId
       );
     }
+
+    // Cập nhật XP & level đơn giản
+    let totalXP = Number(updatedProgress.totalXP) || 0;
+    if (learned && !alreadyLearned) {
+      totalXP += XP_PER_NEW_WORD;
+    }
+    updatedProgress.totalXP = totalXP;
+    updatedProgress.level = computeLevelName(totalXP);
 
     await saveLearningProgress(updatedProgress);
     return true;

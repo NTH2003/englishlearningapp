@@ -12,8 +12,8 @@ import {
   Platform,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
-import {COLORS} from '../constants';
-import {markWordAsLearned} from '../services/vocabularyService';
+import {COLORS} from '../../constants';
+import {markWordAsLearned} from '../../services/vocabularyService';
 
 const {width: SCREEN_WIDTH} = Dimensions.get('window');
 

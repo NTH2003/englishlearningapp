@@ -1,6 +1,4 @@
 // Dữ liệu video học tiếng Anh
-import {vocabularyData} from './vocabularyData';
-
 export const videoData = [
   {
     id: 1,
@@ -47,21 +45,6 @@ export const videoData = [
     relatedWordIds: [16, 17, 18, 19, 20],
   },
 ];
-
-// Hàm lấy từ vựng liên quan đến video
-export const getRelatedWords = (videoId) => {
-  const video = videoData.find((v) => v.id === videoId);
-  if (!video) return [];
-  
-  return vocabularyData.filter((word) => 
-    video.relatedWordIds.includes(word.id)
-  );
-};
-
-// Hàm lấy video theo ID
-export const getVideoById = (id) => {
-  return videoData.find((video) => video.id === id);
-};
 
 // Hàm lấy tất cả videos
 export const getAllVideos = () => {

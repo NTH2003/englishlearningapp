@@ -1,4 +1,4 @@
-import React from 'react';
+import React, {useEffect, useMemo, useState} from 'react';
 import {
   View,
   Text,
@@ -6,9 +6,11 @@ import {
   TouchableOpacity,
   SafeAreaView,
   ScrollView,
+  Alert,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
-import {COLORS} from '../constants';
+import {COLORS} from '../../constants';
+import {getLearningProgress} from '../../services/storageService';
 
 const STUDY_MODES = [
   {
@@ -44,30 +46,63 @@ const STUDY_MODES = [
 const StudyModeSelectionScreen = ({route}) => {
   const navigation = useNavigation();
   const {words, topicId, topic} = route.params || {};
+  const [selectedLevel, setSelectedLevel] = useState('all'); // all | beginner | intermediate
+  const [userLevel, setUserLevel] = useState('all'); // 'Sơ cấp' | 'Trung cấp' | 'Nâng cao' | 'all'
+
+  useEffect(() => {
+    const loadUserLevel = async () => {
+      try {
+        const lp = await getLearningProgress();
+        const lvl = lp?.level;
+        setUserLevel(lvl || 'all');
+        if (lvl === 'Sơ cấp') {
+          setSelectedLevel('beginner');
+        }
+      } catch (_) {
+        setUserLevel('all');
+      }
+    };
+    loadUserLevel();
+  }, []);
+
+  const filteredWords = useMemo(() => {
+    if (!Array.isArray(words)) return [];
+    if (selectedLevel === 'all') return words;
+    const key = selectedLevel === 'beginner' ? 'Beginner' : 'Intermediate';
+    return words.filter(w => w.level === key);
+  }, [words, selectedLevel]);
 
   const handleSelectMode = (modeId) => {
+    if (!filteredWords.length) {
+      Alert.alert(
+        'Chưa có từ vựng',
+        'Chủ đề này chưa có từ cho cấp độ bạn chọn. Hãy chọn cấp độ khác.',
+      );
+      return;
+    }
+
     switch (modeId) {
       case 'flashcard':
         navigation.navigate('VocabularyFlashcard', {
-          words,
+          words: filteredWords,
           topicId,
         });
         break;
       case 'quiz':
         navigation.navigate('VocabularyQuiz', {
-          words,
+          words: filteredWords,
           topicId,
         });
         break;
       case 'typing':
         navigation.navigate('VocabularyTyping', {
-          words,
+          words: filteredWords,
           topicId,
         });
         break;
       case 'listening':
         navigation.navigate('VocabularyListening', {
-          words,
+          words: filteredWords,
           topicId,
         });
         break;
@@ -96,7 +131,9 @@ const StudyModeSelectionScreen = ({route}) => {
           <Text style={styles.topicIcon}>{topic.icon}</Text>
           <View style={styles.topicDetails}>
             <Text style={styles.topicName}>{topic.name}</Text>
-            <Text style={styles.topicStats}>{words?.length || 0} từ vựng</Text>
+            <Text style={styles.topicStats}>
+              {filteredWords.length || 0} / {words?.length || 0} từ vựng
+            </Text>
           </View>
         </View>
       )}
@@ -106,7 +143,60 @@ const StudyModeSelectionScreen = ({route}) => {
         style={styles.content}
         contentContainerStyle={styles.contentContainer}
         showsVerticalScrollIndicator={false}>
-        <Text style={styles.sectionTitle}>Chọn cách học phù hợp với bạn</Text>
+        <Text style={styles.sectionTitle}>Chọn cấp độ & cách học phù hợp với bạn</Text>
+
+        {/* Level filter */}
+        <View style={styles.levelFilterRow}>
+          {userLevel !== 'Sơ cấp' && (
+            <TouchableOpacity
+              style={[
+                styles.levelChip,
+                selectedLevel === 'all' && styles.levelChipActive,
+              ]}
+              onPress={() => setSelectedLevel('all')}
+              activeOpacity={0.7}>
+              <Text
+                style={[
+                  styles.levelChipText,
+                  selectedLevel === 'all' && styles.levelChipTextActive,
+                ]}>
+                Tất cả
+              </Text>
+            </TouchableOpacity>
+          )}
+          <TouchableOpacity
+            style={[
+              styles.levelChip,
+              selectedLevel === 'beginner' && styles.levelChipActive,
+            ]}
+            onPress={() => setSelectedLevel('beginner')}
+            activeOpacity={0.7}>
+            <Text
+              style={[
+                styles.levelChipText,
+                selectedLevel === 'beginner' && styles.levelChipTextActive,
+              ]}>
+              Sơ cấp
+            </Text>
+          </TouchableOpacity>
+          {userLevel !== 'Sơ cấp' && (
+            <TouchableOpacity
+              style={[
+                styles.levelChip,
+                selectedLevel === 'intermediate' && styles.levelChipActive,
+              ]}
+              onPress={() => setSelectedLevel('intermediate')}
+              activeOpacity={0.7}>
+              <Text
+                style={[
+                  styles.levelChipText,
+                  selectedLevel === 'intermediate' && styles.levelChipTextActive,
+                ]}>
+                Trung cấp
+              </Text>
+            </TouchableOpacity>
+          )}
+        </View>
         
         {STUDY_MODES.map((mode) => (
           <TouchableOpacity
@@ -201,7 +291,32 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: COLORS.TEXT_SECONDARY,
+    marginBottom: 12,
+  },
+  levelFilterRow: {
+    flexDirection: 'row',
     marginBottom: 16,
+    gap: 8,
+  },
+  levelChip: {
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: COLORS.BORDER,
+    backgroundColor: COLORS.BACKGROUND_WHITE,
+  },
+  levelChipActive: {
+    backgroundColor: COLORS.PRIMARY_DARK,
+    borderColor: COLORS.PRIMARY_DARK,
+  },
+  levelChipText: {
+    fontSize: 13,
+    color: COLORS.TEXT_SECONDARY,
+    fontWeight: '600',
+  },
+  levelChipTextActive: {
+    color: '#fff',
   },
   modeCard: {
     flexDirection: 'row',

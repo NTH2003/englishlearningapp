@@ -6,12 +6,17 @@ import {
   TouchableOpacity,
   SafeAreaView,
   Animated,
-  Dimensions,
   ScrollView,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
-import {markWordAsLearned} from '../../services/vocabularyService';
+import {getLearningProgress} from '../../services/storageService';
+import {
+  markWordAsLearned,
+  recordReviewQuizAnswer,
+} from '../../services/vocabularyService';
 
 // Import TTS với error handling
 let Tts = null;
@@ -21,11 +26,12 @@ try {
   console.warn('react-native-tts không khả dụng:', error);
 }
 
-const {width: SCREEN_WIDTH} = Dimensions.get('window');
-
 const VocabularyListeningScreen = ({route}) => {
   const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const {words, topicId} = route.params || {};
+  const isReviewQuiz = topicId === 'review';
+  const headerTitleText = isReviewQuiz ? 'Ôn tập nghe chọn' : 'Nghe và chọn';
   
   const [currentIndex, setCurrentIndex] = useState(0);
   const [score, setScore] = useState(0);
@@ -35,6 +41,9 @@ const VocabularyListeningScreen = ({route}) => {
   const [learnedWords, setLearnedWords] = useState(new Set());
   const [isFinished, setIsFinished] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [answerHistory, setAnswerHistory] = useState([]);
+  const [xpStart, setXpStart] = useState(0);
+  const [xpEarned, setXpEarned] = useState(0);
   
   const progressAnimation = useRef(new Animated.Value(0)).current;
   const fadeAnimation = useRef(new Animated.Value(1)).current;
@@ -43,23 +52,23 @@ const VocabularyListeningScreen = ({route}) => {
   const progress = words && words.length > 0 ? ((currentIndex + 1) / words.length) * 100 : 0;
   const [ttsAvailable, setTtsAvailable] = useState(false);
 
-  // Tạo câu hỏi trắc nghiệm
+  // Tạo câu hỏi nghe tiếng Anh và chọn từ tiếng Anh
   const generateQuestion = (word) => {
     if (!word || !words) return null;
     
-    // Lấy 3 từ ngẫu nhiên khác làm đáp án sai
+    // Lấy 3 từ tiếng Anh ngẫu nhiên khác làm đáp án sai
     const wrongAnswers = words
       .filter(w => w.id !== word.id)
       .sort(() => Math.random() - 0.5)
       .slice(0, 3)
-      .map(w => w.meaning);
+      .map(w => w.word);
     
     // Tạo mảng đáp án và xáo trộn
-    const answers = [word.meaning, ...wrongAnswers].sort(() => Math.random() - 0.5);
+    const answers = [word.word, ...wrongAnswers].sort(() => Math.random() - 0.5);
     
     return {
-      question: 'Nghe và chọn nghĩa đúng của từ vựng',
-      correctAnswer: word.meaning,
+      question: 'Nghe và chọn từ đúng',
+      correctAnswer: word.word,
       answers,
       word: word.word,
       pronunciation: word.pronunciation,
@@ -67,6 +76,38 @@ const VocabularyListeningScreen = ({route}) => {
   };
 
   const [currentQuestion, setCurrentQuestion] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await getLearningProgress();
+        if (!cancelled) {
+          setXpStart(Math.max(0, Number(p?.totalXP) || 0));
+        }
+      } catch (_) {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isFinished) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const p = await getLearningProgress();
+        const latest = Math.max(0, Number(p?.totalXP) || 0);
+        if (!cancelled) {
+          setXpEarned(Math.max(0, latest - xpStart));
+        }
+      } catch (_) {}
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [isFinished, xpStart]);
 
   useEffect(() => {
     // Kiểm tra và cấu hình TTS
@@ -107,6 +148,14 @@ const VocabularyListeningScreen = ({route}) => {
     }
   }, [currentIndex, currentWord]);
 
+  useEffect(() => {
+    if (!currentWord || !ttsAvailable) return;
+    const id = setTimeout(() => {
+      handlePlayPronunciation();
+    }, 240);
+    return () => clearTimeout(id);
+  }, [currentIndex, currentWord?.id, ttsAvailable]);
+
   const handlePlayPronunciation = () => {
     if (currentWord && ttsAvailable) {
       setIsPlaying(true);
@@ -130,10 +179,25 @@ const VocabularyListeningScreen = ({route}) => {
     const correct = answer === currentQuestion.correctAnswer;
     setIsCorrect(correct);
     setShowResult(true);
+    setAnswerHistory((prev) => {
+      const next = [...prev];
+      next[currentIndex] = {
+        index: currentIndex,
+        question: currentQuestion?.question || '',
+        selectedAnswer: answer,
+        correctAnswer: currentQuestion?.correctAnswer || '',
+        isCorrect: correct,
+      };
+      return next;
+    });
 
-    if (correct) {
-      setScore(score + 1);
-      // Đánh dấu từ đã học
+    if (isReviewQuiz && currentWord) {
+      await recordReviewQuizAnswer(currentWord.id, correct);
+      if (correct) {
+        setScore((prev) => prev + 1);
+      }
+    } else if (correct) {
+      setScore((prev) => prev + 1);
       if (currentWord && !learnedWords.has(currentWord.id)) {
         await markWordAsLearned(currentWord.id, true);
         setLearnedWords(new Set([...learnedWords, currentWord.id]));
@@ -176,45 +240,109 @@ const VocabularyListeningScreen = ({route}) => {
     setIsFinished(false);
     setIsPlaying(false);
     setLearnedWords(new Set());
+    setAnswerHistory([]);
   };
 
   if (isFinished) {
     const percentage = Math.round((score / words.length) * 100);
+    const rows = answerHistory.filter(Boolean);
     return (
       <SafeAreaView style={styles.container}>
-        <View style={styles.resultScreen}>
-          <View style={styles.resultCard}>
-            <Text style={styles.resultIcon}>
-              {percentage >= 80 ? '🎉' : percentage >= 60 ? '👍' : '📚'}
+        <View style={[styles.reviewResultHeader, {paddingTop: Math.max(insets.top, 8) + 6}]}>
+          <TouchableOpacity
+            style={styles.reviewResultBack}
+            onPress={handleFinish}
+            activeOpacity={0.8}>
+            <Feather name="arrow-left" size={20} color="#FFFFFF" />
+          </TouchableOpacity>
+          <Text style={styles.reviewResultHeaderTitle}>Kết quả</Text>
+        </View>
+        <ScrollView
+          style={styles.reviewResultScroll}
+          contentContainerStyle={styles.reviewResultContent}
+          showsVerticalScrollIndicator={false}>
+          <View style={styles.reviewSummaryCard}>
+            <View style={styles.reviewSummaryIcon}>
+              <Feather name="headphones" size={34} color="#FFFFFF" />
+            </View>
+            <Text style={styles.reviewSummaryTitle}>
+              {percentage >= 80 ? 'Xuất sắc!' : percentage >= 60 ? 'Khá tốt!' : 'Cố gắng lên!'}
             </Text>
-            <Text style={styles.resultTitle}>Hoàn thành!</Text>
-            <Text style={styles.resultScore}>
-              {score} / {words.length}
-            </Text>
-            <Text style={styles.resultPercentage}>{percentage}%</Text>
-            <Text style={styles.resultMessage}>
+            <Text style={styles.reviewSummaryMessage}>
               {percentage >= 80
-                ? 'Tuyệt vời! Bạn đã nắm vững từ vựng này.'
+                ? 'Bạn nghe và nhận diện nghĩa rất tốt.'
                 : percentage >= 60
-                ? 'Tốt lắm! Hãy tiếp tục luyện tập.'
-                : 'Hãy ôn tập lại để cải thiện kết quả.'}
+                  ? 'Kết quả ổn rồi. Nghe thêm vài lần để chắc hơn nhé.'
+                  : 'Bạn còn nhiều từ cần ôn lại. Thử làm lại ngay nhé!'}
             </Text>
-            <View style={styles.resultButtons}>
+
+            <View style={styles.reviewSummaryStats}>
+              <View style={styles.reviewStatBoxLeft}>
+                <Text style={styles.reviewStatPrimaryOrange}>{percentage}%</Text>
+                <Text style={styles.reviewStatLabel}>Điểm số</Text>
+              </View>
+              <View style={styles.reviewStatBoxRight}>
+                <Text style={styles.reviewStatPrimaryBlue}>
+                  {score}/{words.length}
+                </Text>
+                <Text style={styles.reviewStatLabel}>Đúng/Tổng số</Text>
+              </View>
+            </View>
+            <Text style={styles.reviewXpText}>XP nhận: +{xpEarned}</Text>
+
+            <View style={styles.reviewSummaryActions}>
               <TouchableOpacity
-                style={styles.restartButton}
-                onPress={handleRestart}
-                activeOpacity={0.7}>
-                <Text style={styles.restartButtonText}>Làm lại</Text>
+                style={styles.reviewSecondaryButton}
+                onPress={handleFinish}
+                activeOpacity={0.85}>
+                <Text style={styles.reviewSecondaryButtonText}>Về danh sách</Text>
               </TouchableOpacity>
               <TouchableOpacity
-                style={styles.finishButton}
-                onPress={handleFinish}
-                activeOpacity={0.7}>
-                <Text style={styles.finishButtonText}>Hoàn thành</Text>
+                style={styles.reviewPrimaryButton}
+                onPress={handleRestart}
+                activeOpacity={0.85}>
+                <Text style={styles.reviewPrimaryButtonText}>Làm lại</Text>
               </TouchableOpacity>
             </View>
           </View>
-        </View>
+          <Text style={styles.reviewDetailTitle}>Chi tiết câu trả lời</Text>
+          {rows.map((row) => (
+            <View key={row.index} style={styles.reviewAnswerCard}>
+              <View style={styles.reviewAnswerHead}>
+                <View
+                  style={[
+                    styles.reviewAnswerStatusIcon,
+                    row.isCorrect
+                      ? styles.reviewAnswerStatusIconCorrect
+                      : styles.reviewAnswerStatusIconWrong,
+                  ]}>
+                  <Feather
+                    name={row.isCorrect ? 'check' : 'x'}
+                    size={14}
+                    color="#FFFFFF"
+                  />
+                </View>
+                <Text style={styles.reviewAnswerQuestion}>
+                  Câu {row.index + 1}: {row.question}
+                </Text>
+              </View>
+              <Text
+                style={[
+                  styles.reviewAnswerLine,
+                  row.isCorrect
+                    ? styles.reviewAnswerUserCorrect
+                    : styles.reviewAnswerUserWrong,
+                ]}>
+                Bạn trả lời: {row.selectedAnswer}
+              </Text>
+              {!row.isCorrect ? (
+                <Text style={styles.reviewAnswerCorrect}>
+                  Đáp án đúng: {row.correctAnswer}
+                </Text>
+              ) : null}
+            </View>
+          ))}
+        </ScrollView>
       </SafeAreaView>
     );
   }
@@ -236,40 +364,43 @@ const VocabularyListeningScreen = ({route}) => {
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
-        <TouchableOpacity
-          style={styles.backButton}
-          onPress={() => navigation.goBack()}
-          activeOpacity={0.7}>
-          <Text style={styles.backButtonText}>← Quay lại</Text>
-        </TouchableOpacity>
-        <View style={styles.headerRight}>
-          <Text style={styles.scoreText}>Điểm: {score}/{words.length}</Text>
-          <Text style={styles.progressText}>
-            {currentIndex + 1} / {words.length}
+      <View style={[styles.topOrange, {paddingTop: Math.max(insets.top, 8) + 4}]}>
+        <View style={styles.header}>
+          <TouchableOpacity
+            style={styles.backButton}
+            onPress={() => navigation.goBack()}
+            activeOpacity={0.8}>
+            <Feather name="arrow-left" size={22} color="#FFFFFF" />
+          </TouchableOpacity>
+          <View style={styles.headerCenter}>
+            <Text style={styles.headerTitle} numberOfLines={1}>
+              {headerTitleText}
+            </Text>
+            <Text style={styles.headerSubtitle}>
+              Câu {currentIndex + 1}/{words.length}
+            </Text>
+          </View>
+          <View style={styles.headerRightSpacer} />
+        </View>
+
+        <View style={styles.progressBarContainer}>
+          <View style={styles.progressBarBackground}>
+            <Animated.View
+              style={[
+                styles.progressBarFill,
+                {
+                  width: progressWidth,
+                },
+              ]}
+            />
+          </View>
+          <Text style={styles.progressPercentage}>
+            {Math.round(progress)}%
           </Text>
         </View>
       </View>
 
-      {/* Progress Bar */}
-      <View style={styles.progressBarContainer}>
-        <View style={styles.progressBarBackground}>
-          <Animated.View
-            style={[
-              styles.progressBarFill,
-              {
-                width: progressWidth,
-              },
-            ]}
-          />
-        </View>
-        <Text style={styles.progressPercentage}>
-          {Math.round(progress)}%
-        </Text>
-      </View>
-
-      {/* Question Card */}
+      <View style={styles.pageBody}>
       <Animated.View style={[styles.questionCard, {opacity: fadeAnimation}]}>
         <ScrollView
           style={styles.scrollContent}
@@ -286,11 +417,15 @@ const VocabularyListeningScreen = ({route}) => {
               onPress={handlePlayPronunciation}
               disabled={!ttsAvailable || isPlaying}
               activeOpacity={0.7}>
-              <Text style={styles.playIcon}>
-                {isPlaying ? '⏸' : '🔊'}
-              </Text>
+              <View style={styles.playIconWrap}>
+                <Feather
+                  name={isPlaying ? 'pause' : 'volume-2'}
+                  size={16}
+                  color={COLORS.PRIMARY_DARK}
+                />
+              </View>
               <Text style={styles.playButtonText}>
-                {isPlaying ? 'Đang phát...' : 'Nghe từ vựng'}
+                {isPlaying ? 'Đang phát...' : 'Nghe lại'}
               </Text>
             </TouchableOpacity>
             {!ttsAvailable && (
@@ -368,6 +503,7 @@ const VocabularyListeningScreen = ({route}) => {
           </View>
         )}
       </Animated.View>
+      </View>
     </SafeAreaView>
   );
 };
@@ -377,63 +513,72 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.BACKGROUND,
   },
+  topOrange: {
+    backgroundColor: COLORS.PRIMARY,
+    paddingHorizontal: 12,
+    paddingBottom: 10,
+  },
   header: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    padding: 20,
-    paddingTop: 10,
+    gap: 8,
   },
   backButton: {
-    padding: 8,
+    width: 32,
+    height: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  backButtonText: {
-    fontSize: 16,
-    color: COLORS.PRIMARY_DARK,
-    fontWeight: '600',
+  headerCenter: {
+    flex: 1,
+    minWidth: 0,
   },
-  headerRight: {
-    alignItems: 'flex-end',
+  headerTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: '#FFFFFF',
   },
-  scoreText: {
+  headerSubtitle: {
+    marginTop: 2,
     fontSize: 14,
-    color: COLORS.SUCCESS,
+    color: 'rgba(255,255,255,0.95)',
     fontWeight: '600',
-    marginBottom: 4,
   },
-  progressText: {
-    fontSize: 16,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
+  headerRightSpacer: {
+    width: 32,
+    height: 32,
   },
   progressBarContainer: {
-    paddingHorizontal: 20,
-    paddingBottom: 12,
+    paddingTop: 8,
   },
   progressBarBackground: {
-    height: 8,
-    backgroundColor: COLORS.BORDER,
+    height: 6,
+    backgroundColor: 'rgba(255,255,255,0.35)',
     borderRadius: 4,
     overflow: 'hidden',
-    marginBottom: 8,
+    marginBottom: 6,
   },
   progressBarFill: {
     height: '100%',
-    backgroundColor: COLORS.PRIMARY_DARK,
+    backgroundColor: '#292524',
     borderRadius: 4,
   },
   progressPercentage: {
     fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
+    color: 'rgba(255,255,255,0.95)',
     textAlign: 'right',
-    fontWeight: '600',
+    fontWeight: '700',
+  },
+  pageBody: {
+    flex: 1,
+    paddingHorizontal: 12,
+    paddingTop: 12,
+    paddingBottom: 10,
   },
   questionCard: {
     flex: 1,
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    marginHorizontal: 20,
-    marginTop: 20,
-    marginBottom: 20,
+    marginHorizontal: 4,
     borderRadius: 20,
     shadowColor: COLORS.TEXT,
     shadowOffset: {width: 0, height: 4},
@@ -459,29 +604,36 @@ const styles = StyleSheet.create({
   },
   playContainer: {
     alignItems: 'center',
-    marginBottom: 32,
+    marginBottom: 24,
   },
   playButton: {
-    backgroundColor: COLORS.PRIMARY_DARK,
-    borderRadius: 50,
-    paddingVertical: 20,
-    paddingHorizontal: 40,
+    backgroundColor: COLORS.PRIMARY_SOFT,
+    borderWidth: 1,
+    borderColor: '#FDBA74',
+    borderRadius: 999,
+    paddingVertical: 10,
+    paddingHorizontal: 14,
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 12,
-    minWidth: 200,
+    gap: 8,
+    minWidth: 126,
     justifyContent: 'center',
   },
   playButtonPlaying: {
-    backgroundColor: COLORS.PRIMARY,
+    backgroundColor: '#FED7AA',
   },
-  playIcon: {
-    fontSize: 32,
+  playIconWrap: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    backgroundColor: '#FFF',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   playButtonText: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: COLORS.BACKGROUND_WHITE,
+    fontSize: 14,
+    fontWeight: '800',
+    color: COLORS.PRIMARY_DARK,
   },
   ttsWarning: {
     fontSize: 12,
@@ -616,82 +768,198 @@ const styles = StyleSheet.create({
     fontSize: 18,
     color: COLORS.TEXT_SECONDARY,
   },
-  resultScreen: {
-    flex: 1,
+  reviewResultHeader: {
+    backgroundColor: COLORS.PRIMARY_DARK,
+    paddingHorizontal: 12,
+    paddingBottom: 12,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  reviewResultBack: {
+    width: 30,
+    height: 30,
+    borderRadius: 15,
+    alignItems: 'center',
     justifyContent: 'center',
+  },
+  reviewResultHeaderTitle: {
+    fontSize: 22,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  reviewResultBody: {
+    flex: 1,
+    padding: 14,
+    justifyContent: 'center',
+  },
+  reviewResultScroll: {
+    flex: 1,
+  },
+  reviewResultContent: {
+    padding: 14,
+    paddingBottom: 26,
+  },
+  reviewSummaryCard: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    borderRadius: 16,
+    padding: 14,
     alignItems: 'center',
-    padding: 20,
   },
-  resultCard: {
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 20,
-    padding: 32,
+  reviewSummaryIcon: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    backgroundColor: '#F97316',
     alignItems: 'center',
-    width: '100%',
-    shadowColor: COLORS.TEXT,
-    shadowOffset: {width: 0, height: 4},
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    elevation: 8,
+    justifyContent: 'center',
   },
-  resultIcon: {
-    fontSize: 64,
-    marginBottom: 16,
-  },
-  resultTitle: {
+  reviewSummaryTitle: {
+    marginTop: 14,
     fontSize: 24,
-    fontWeight: 'bold',
-    color: COLORS.TEXT,
-    marginBottom: 16,
+    fontWeight: '800',
+    color: '#0F172A',
   },
-  resultScore: {
-    fontSize: 36,
-    fontWeight: 'bold',
-    color: COLORS.PRIMARY_DARK,
-    marginBottom: 8,
-  },
-  resultPercentage: {
-    fontSize: 20,
-    color: COLORS.TEXT_SECONDARY,
-    marginBottom: 24,
-  },
-  resultMessage: {
-    fontSize: 16,
+  reviewSummaryMessage: {
+    marginTop: 8,
+    fontSize: 14,
     color: COLORS.TEXT_SECONDARY,
     textAlign: 'center',
-    marginBottom: 32,
-    lineHeight: 24,
   },
-  resultButtons: {
+  reviewSummaryStats: {
+    marginTop: 16,
+    width: '100%',
     flexDirection: 'row',
     gap: 12,
+  },
+  reviewStatBoxLeft: {
+    flex: 1,
+    backgroundColor: '#FEF3E8',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  reviewStatBoxRight: {
+    flex: 1,
+    backgroundColor: '#EEF2FF',
+    borderRadius: 14,
+    paddingVertical: 14,
+    alignItems: 'center',
+  },
+  reviewStatPrimaryOrange: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: COLORS.PRIMARY_DARK,
+  },
+  reviewStatPrimaryBlue: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#2563EB',
+  },
+  reviewStatLabel: {
+    marginTop: 4,
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#334155',
+  },
+  reviewXpText: {
+    marginTop: 10,
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#7C3AED',
+  },
+  reviewSummaryActions: {
+    marginTop: 16,
     width: '100%',
+    flexDirection: 'row',
+    gap: 10,
   },
-  restartButton: {
+  reviewSecondaryButton: {
     flex: 1,
-    backgroundColor: COLORS.BACKGROUND,
-    borderRadius: 12,
-    padding: 16,
+    height: 44,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    backgroundColor: '#FFFFFF',
     alignItems: 'center',
-    borderWidth: 2,
-    borderColor: COLORS.BORDER,
+    justifyContent: 'center',
   },
-  restartButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: COLORS.TEXT,
+  reviewSecondaryButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#111827',
   },
-  finishButton: {
+  reviewPrimaryButton: {
     flex: 1,
+    height: 44,
+    borderRadius: 10,
     backgroundColor: COLORS.PRIMARY_DARK,
-    borderRadius: 12,
-    padding: 16,
     alignItems: 'center',
+    justifyContent: 'center',
   },
-  finishButtonText: {
+  reviewPrimaryButtonText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: '#FFFFFF',
+  },
+  reviewDetailTitle: {
+    marginTop: 18,
+    marginBottom: 10,
+    fontSize: 14,
+    fontWeight: '800',
+    color: '#0F172A',
+  },
+  reviewAnswerCard: {
+    backgroundColor: '#FFFFFF',
+    borderWidth: 1,
+    borderColor: '#D1D5DB',
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 10,
+  },
+  reviewAnswerHead: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 8,
+  },
+  reviewAnswerStatusIcon: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginTop: 1,
+  },
+  reviewAnswerStatusIconCorrect: {
+    backgroundColor: '#22C55E',
+  },
+  reviewAnswerStatusIconWrong: {
+    backgroundColor: '#EF4444',
+  },
+  reviewAnswerQuestion: {
+    flex: 1,
     fontSize: 16,
+    fontWeight: '700',
+    color: '#0F172A',
+  },
+  reviewAnswerLine: {
+    marginTop: 8,
+    fontSize: 14,
     fontWeight: '600',
-    color: COLORS.BACKGROUND_WHITE,
+  },
+  reviewAnswerUserCorrect: {
+    color: '#16A34A',
+  },
+  reviewAnswerUserWrong: {
+    color: '#EF4444',
+  },
+  reviewAnswerCorrect: {
+    marginTop: 4,
+    fontSize: 14,
+    color: '#16A34A',
+    fontWeight: '700',
   },
 });
 

@@ -1,5 +1,24 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import {STORAGE_KEYS} from '../constants';
+import {emitLearningProgressUpdated} from './learningProgressEvents';
+import {computeLevelName} from './levelService';
+
+/** Khi không có Firebase: tiến độ chỉ trong phiên (mất khi tắt app). */
+let _sessionLearningProgress = null;
+let _sessionUserData = null;
+
+/** Lọc chủ đề có id + name hợp lệ (tránh Firebase/cache hỏng → màn Từ vựng trống). */
+function _normalizeTopicsList(list) {
+  if (!Array.isArray(list)) {
+    return [];
+  }
+  return list.filter(
+    (t) =>
+      t &&
+      typeof t.id === 'string' &&
+      String(t.id).trim().length > 0 &&
+      t.name != null &&
+      String(t.name).trim().length > 0,
+  );
+}
 
 /**
  * Lấy firebaseService nếu Firebase đã cài và cấu hình. Trả về null nếu không dùng được.
@@ -13,75 +32,40 @@ function _getFirebase() {
 }
 
 /**
- * Gộp tiến độ local và remote (trùng thì giữ cả hai, dùng Set để bỏ trùng).
- */
-function _mergeProgress(local, remote) {
-  const arr = (key) => [
-    ...new Set([
-      ...(Array.isArray(remote?.[key]) ? remote[key] : []),
-      ...(Array.isArray(local?.[key]) ? local[key] : []),
-    ]),
-  ];
-  return {
-    wordsLearned: arr('wordsLearned'),
-    lessonsCompleted: arr('lessonsCompleted'),
-    videosWatched: arr('videosWatched'),
-    favoriteWords: arr('favoriteWords'),
-  };
-}
-
-/**
- * Migration một lần: đọc tiến độ từ AsyncStorage, gộp với Firestore, lưu lên Firebase rồi xóa bản local.
- * Gọi khi app mở và Firebase đã init thành công.
- */
-async function _migrateLocalProgressToFirebase() {
-  const fb = _getFirebase();
-  if (!fb) return;
-  try {
-    const uid = await fb.ensureInit();
-    if (!uid) return;
-    const raw = await AsyncStorage.getItem(STORAGE_KEYS.LEARNING_PROGRESS);
-    if (!raw) return;
-    const local = JSON.parse(raw);
-    const remote = await fb.getLearningProgress();
-    const merged = _mergeProgress(local, remote);
-    await fb.saveLearningProgress(merged);
-    await AsyncStorage.removeItem(STORAGE_KEYS.LEARNING_PROGRESS);
-  } catch (_) {}
-}
-
-/**
- * Khởi tạo đồng bộ Firebase: đăng nhập ẩn danh + migration dữ liệu local lên Firestore.
- * Nên gọi 1 lần khi app mở (ví dụ trong App.js).
+ * Khởi tạo Firebase (đăng nhập ẩn danh).
+ * Không dùng AsyncStorage — tránh lỗi NativeModule null khi package đã gỡ khỏi dự án.
  */
 export async function initStorageSync() {
   const fb = _getFirebase();
   if (fb) {
     try {
       await fb.ensureInit();
-      await _migrateLocalProgressToFirebase();
+      if (typeof fb.ensureFirestoreAuthReady === 'function') {
+        void fb.ensureFirestoreAuthReady().catch(() => {});
+      }
+      // Không chặn màn chờ vô hạn nếu ghi Firestore treo — vẫn chạy sync nền.
+      if (typeof fb.syncAuthProfileToFirestore === 'function') {
+        void Promise.race([
+          fb.syncAuthProfileToFirestore(),
+          new Promise((r) => setTimeout(r, 12000)),
+        ]).catch(() => {});
+      }
     } catch (_) {}
   }
 }
 
-// Lưu dữ liệu người dùng
 export const saveUserData = async (userData) => {
   const fb = _getFirebase();
   if (fb) {
     try {
       if (await fb.saveUserData(userData)) return true;
     } catch (_) {}
-  }
-  try {
-    await AsyncStorage.setItem(STORAGE_KEYS.USER_DATA, JSON.stringify(userData));
-    return true;
-  } catch (error) {
-    console.error('Error saving user data:', error);
     return false;
   }
+  _sessionUserData = userData;
+  return true;
 };
 
-// Lấy dữ liệu người dùng
 export const getUserData = async () => {
   const fb = _getFirebase();
   if (fb) {
@@ -89,55 +73,98 @@ export const getUserData = async () => {
       const data = await fb.getUserData();
       if (data !== undefined && data !== null) return data;
     } catch (_) {}
-  }
-  try {
-    const data = await AsyncStorage.getItem(STORAGE_KEYS.USER_DATA);
-    return data ? JSON.parse(data) : null;
-  } catch (error) {
-    console.error('Error getting user data:', error);
     return null;
   }
+  return _sessionUserData;
 };
 
-// Lưu tiến độ học tập
+/**
+ * Gộp tiến độ cho bản chỉ lưu trong phiên (không Firebase).
+ */
+async function _mergeLearningProgressSession(incoming) {
+  const inc = incoming && typeof incoming === 'object' ? incoming : {};
+  const base = _sessionLearningProgress;
+  const defaults = {
+    wordsLearned: [],
+    lessonsCompleted: [],
+    videosWatched: [],
+    videosNeedPractice: [],
+  };
+  const merged = {...defaults, ...(base || {}), ...inc};
+  if (merged && typeof merged === 'object' && 'favoriteWords' in merged) {
+    delete merged.favoriteWords;
+  }
+  const bfs =
+    base?.flashcardSelfReport && typeof base.flashcardSelfReport === 'object'
+      ? base.flashcardSelfReport
+      : {};
+  const ifs =
+    inc?.flashcardSelfReport && typeof inc.flashcardSelfReport === 'object'
+      ? inc.flashcardSelfReport
+      : {};
+  delete merged.flashcardSelfReport;
+  if (Object.keys({...bfs, ...ifs}).length) {
+    merged.flashcardSelfReport = {...bfs, ...ifs};
+  }
+  const bvc =
+    base?.videoViewCounts && typeof base.videoViewCounts === 'object'
+      ? base.videoViewCounts
+      : {};
+  const ivc =
+    inc?.videoViewCounts && typeof inc.videoViewCounts === 'object'
+      ? inc.videoViewCounts
+      : {};
+  merged.videoViewCounts = {...bvc, ...ivc};
+  if (Array.isArray(inc.reviewWrongWordIds)) {
+    merged.reviewWrongWordIds = inc.reviewWrongWordIds;
+  } else if (Array.isArray(base?.reviewWrongWordIds)) {
+    merged.reviewWrongWordIds = base.reviewWrongWordIds;
+  } else {
+    merged.reviewWrongWordIds = [];
+  }
+  const rawNeedPractice = Array.isArray(merged.videosNeedPractice)
+    ? merged.videosNeedPractice
+    : [];
+  merged.videosNeedPractice = [...new Set(rawNeedPractice.map((id) => String(id)))];
+  return merged;
+}
+
+/**
+ * Ghi tiến độ: Firestore dùng transaction gộp với bản mới nhất trên server (không đọc-get rồi set riêng).
+ */
 export const saveLearningProgress = async (progress) => {
   const fb = _getFirebase();
   if (fb) {
     try {
-      if (await fb.saveLearningProgress(progress)) return true;
+      const ok = await fb.saveLearningProgress(progress);
+      if (ok) {
+        emitLearningProgressUpdated();
+        return true;
+      }
     } catch (_) {}
-  }
-  try {
-    await AsyncStorage.setItem(
-      STORAGE_KEYS.LEARNING_PROGRESS,
-      JSON.stringify(progress),
-    );
-    return true;
-  } catch (error) {
-    console.error('Error saving learning progress:', error);
     return false;
   }
+  const merged = await _mergeLearningProgressSession(progress);
+  _sessionLearningProgress = merged;
+  emitLearningProgressUpdated();
+  return true;
 };
 
-// Lấy tiến độ học tập
-export const getLearningProgress = async () => {
+/**
+ * @param {{ source?: 'default' | 'server' | 'cache' }} [options]
+ */
+export const getLearningProgress = async (options) => {
   const fb = _getFirebase();
   if (fb) {
     try {
-      const data = await fb.getLearningProgress();
-      if (data !== undefined && data !== null) return data;
-    } catch (_) {}
+      return await fb.getLearningProgress(options || {});
+    } catch (_) {
+      return null;
+    }
   }
-  try {
-    const data = await AsyncStorage.getItem(STORAGE_KEYS.LEARNING_PROGRESS);
-    return data ? JSON.parse(data) : null;
-  } catch (error) {
-    console.error('Error getting learning progress:', error);
-    return null;
-  }
+  return _sessionLearningProgress;
 };
 
-// Ghi nhận video đã xem
 export const addVideoWatched = async (videoId) => {
   const fb = _getFirebase();
   if (fb) {
@@ -151,7 +178,6 @@ export const addVideoWatched = async (videoId) => {
       wordsLearned: [],
       lessonsCompleted: [],
       videosWatched: [],
-      favoriteWords: [],
     };
 
     if (!Array.isArray(updated.videosWatched)) {
@@ -169,113 +195,145 @@ export const addVideoWatched = async (videoId) => {
   }
 };
 
-// Thêm từ vào danh sách yêu thích
-export const addFavoriteWord = async (wordId) => {
-  const fb = _getFirebase();
-  if (fb) {
-    try {
-      if (await fb.addFavoriteWord(wordId)) return true;
-    } catch (_) {}
-  }
+/**
+ * Đánh dấu video cần luyện tập thêm khi người học "chưa hiểu".
+ * needsPractice=false sẽ gỡ video khỏi danh sách cần luyện tập.
+ */
+export const setVideoNeedsPractice = async (videoId, needsPractice = true) => {
+  if (videoId == null) return false;
+  const key = String(videoId);
   try {
-    const progress = await getLearningProgress();
-    const updated = progress || {
+    const progress = (await getLearningProgress()) || {
       wordsLearned: [],
       lessonsCompleted: [],
       videosWatched: [],
-      favoriteWords: [],
+      videosNeedPractice: [],
     };
-
-    if (!Array.isArray(updated.favoriteWords)) {
-      updated.favoriteWords = [];
+    const current = Array.isArray(progress.videosNeedPractice)
+      ? progress.videosNeedPractice.map((id) => String(id))
+      : [];
+    const set = new Set(current);
+    if (needsPractice) {
+      set.add(key);
+    } else {
+      set.delete(key);
     }
-
-    if (!updated.favoriteWords.includes(wordId)) {
-      updated.favoriteWords.push(wordId);
-      await saveLearningProgress(updated);
-    }
-    return true;
-  } catch (error) {
-    console.error('Error adding favorite word:', error);
+    return await saveLearningProgress({
+      ...progress,
+      videosNeedPractice: [...set],
+    });
+  } catch (e) {
+    console.warn('setVideoNeedsPractice', e?.message);
     return false;
   }
 };
 
-// Bỏ từ khỏi danh sách yêu thích
-export const removeFavoriteWord = async (wordId) => {
-  const fb = _getFirebase();
-  if (fb) {
-    try {
-      if (await fb.removeFavoriteWord(wordId)) return true;
-    } catch (_) {}
+/** Hiển thị số lượt xem (đếm trên thiết bị / tài khoản hiện tại). */
+export function formatVideoViewCount(n) {
+  const x = Math.max(0, Math.floor(Number(n) || 0));
+  if (x >= 1_000_000) {
+    const v = x / 1_000_000;
+    return `${v >= 10 ? Math.floor(v) : v.toFixed(1).replace(/\.0$/, '')}M`;
   }
+  if (x >= 1_000) {
+    const v = x / 1_000;
+    return `${v >= 10 ? Math.floor(v) : v.toFixed(1).replace(/\.0$/, '')}K`;
+  }
+  return String(x);
+}
+
+/**
+ * Tăng lượt xem khi người dùng mở màn xem video (theo tiến độ, không nhập tay trong admin).
+ */
+export const incrementVideoViewCount = async (videoId) => {
+  if (videoId == null) return false;
+  const key = String(videoId);
   try {
-    const progress = await getLearningProgress();
-    const updated = progress || {
+    const progress = (await getLearningProgress()) || {
       wordsLearned: [],
       lessonsCompleted: [],
       videosWatched: [],
-      favoriteWords: [],
     };
-
-    if (!Array.isArray(updated.favoriteWords)) {
-      updated.favoriteWords = [];
-    }
-
-    updated.favoriteWords = updated.favoriteWords.filter(id => id !== wordId);
-    await saveLearningProgress(updated);
-    return true;
-  } catch (error) {
-    console.error('Error removing favorite word:', error);
-    return false;
-  }
-};
-
-// Lấy danh sách ID từ yêu thích
-export const getFavoriteWords = async () => {
-  try {
-    const progress = await getLearningProgress();
-    if (!progress || !Array.isArray(progress.favoriteWords)) {
-      return [];
-    }
-    return progress.favoriteWords;
-  } catch (error) {
-    console.error('Error getting favorite words:', error);
-    return [];
-  }
-};
-
-// Kiểm tra 1 từ có nằm trong danh sách yêu thích không
-export const isFavoriteWord = async (wordId) => {
-  try {
-    const favorites = await getFavoriteWords();
-    return favorites.includes(wordId);
-  } catch (error) {
-    console.error('Error checking favorite word:', error);
+    const prev =
+      progress.videoViewCounts && typeof progress.videoViewCounts === 'object'
+        ? progress.videoViewCounts
+        : {};
+    const nextCount = (Number(prev[key]) || 0) + 1;
+    return await saveLearningProgress({
+      ...progress,
+      videoViewCounts: {...prev, [key]: nextCount},
+    });
+  } catch (e) {
+    console.warn('incrementVideoViewCount', e?.message);
     return false;
   }
 };
 
 /**
- * Lấy danh sách chủ đề học: ưu tiên Firebase, không có thì trả về defaultTopics.
- * @param {Array} defaultTopics - Danh sách chủ đề mặc định (dùng khi Firebase trống hoặc lỗi)
- * @returns {Promise<Array>}
+ * Cộng XP theo từng sự kiện duy nhất (không cộng lặp khi đã nhận thưởng trước đó).
+ * @param {string} eventKey khóa định danh duy nhất cho sự kiện XP
+ * @param {number} points số XP cần cộng
+ * @returns {Promise<boolean>} true nếu vừa cộng, false nếu đã cộng trước đó hoặc lỗi
+ */
+export const awardXPIfFirst = async (eventKey, points) => {
+  const key = String(eventKey || '').trim();
+  const pts = Math.max(0, Math.floor(Number(points) || 0));
+  if (!key || pts <= 0) return false;
+  try {
+    const progress = (await getLearningProgress()) || {
+      wordsLearned: [],
+      lessonsCompleted: [],
+      videosWatched: [],
+    };
+    const flags =
+      progress.xpEventFlags && typeof progress.xpEventFlags === 'object'
+        ? {...progress.xpEventFlags}
+        : {};
+    if (flags[key]) {
+      return false;
+    }
+    flags[key] = Date.now();
+    const totalXP = Math.max(0, Number(progress.totalXP) || 0) + pts;
+    const ok = await saveLearningProgress({
+      ...progress,
+      totalXP,
+      level: computeLevelName(totalXP),
+      xpEventFlags: flags,
+    });
+    return Boolean(ok);
+  } catch (_) {
+    return false;
+  }
+};
+
+/**
+ * Chủ đề: Firestore (config/topics) hoặc seed trong code.
  */
 export const getTopics = async (defaultTopics = []) => {
+  const normalizedDefault = _normalizeTopicsList(
+    Array.isArray(defaultTopics) ? defaultTopics : [],
+  );
+  const fallback = normalizedDefault;
+
   const fb = _getFirebase();
   if (fb) {
     try {
-      const fromFb = await fb.getTopics();
-      if (Array.isArray(fromFb) && fromFb.length > 0) return fromFb;
+      // Ưu tiên cache để phản hồi nhanh; chỉ gọi server 1 lần khi cần.
+      const fromCache = await fb.getTopics({source: 'cache'});
+      const normalizedCache = _normalizeTopicsList(fromCache);
+      if (normalizedCache.length > 0) return normalizedCache;
+
+      const fromServer = await fb.getTopics({source: 'server'});
+      const normalizedServer = _normalizeTopicsList(fromServer);
+      if (normalizedServer.length > 0) return normalizedServer;
     } catch (_) {}
+    return fallback;
   }
-  return Array.isArray(defaultTopics) ? defaultTopics : [];
+  return fallback;
 };
 
 /**
- * Lưu danh sách chủ đề học lên Firebase (nếu có Firebase).
- * @param {Array} topics
- * @returns {Promise<{ok: boolean, error?: string}>}
+ * Lưu danh sách chủ đề lên Firebase.
  */
 export const saveTopics = async (topics) => {
   const fb = _getFirebase();
@@ -289,7 +347,6 @@ export const saveTopics = async (topics) => {
   }
 };
 
-// Xóa tất cả dữ liệu (đăng xuất)
 export const clearAllData = async () => {
   const fb = _getFirebase();
   if (fb) {
@@ -297,15 +354,7 @@ export const clearAllData = async () => {
       await fb.clearAllData();
     } catch (_) {}
   }
-  try {
-    await AsyncStorage.multiRemove([
-      STORAGE_KEYS.USER_DATA,
-      STORAGE_KEYS.LEARNING_PROGRESS,
-      STORAGE_KEYS.SETTINGS,
-    ]);
-    return true;
-  } catch (error) {
-    console.error('Error clearing data:', error);
-    return false;
-  }
+  _sessionLearningProgress = null;
+  _sessionUserData = null;
+  return true;
 };

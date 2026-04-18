@@ -1,16 +1,26 @@
-import React, {useState, useCallback} from 'react';
+import React, {useState, useCallback, useEffect} from 'react';
 import {
   View,
   Text,
   ScrollView,
   TouchableOpacity,
   StyleSheet,
-  SafeAreaView,
+  Animated,
+  StatusBar,
+  Platform,
 } from 'react-native';
+import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
 import {useNavigation, useFocusEffect} from '@react-navigation/native';
+import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
-import {clearAllData, getLearningProgress} from '../../services/storageService';
-import {getLearnedWordsCount} from '../../services/vocabularyService';
+import {THEME} from '../../theme';
+import {
+  clearAllData,
+  getLearningProgress,
+  getUserData,
+} from '../../services/storageService';
+import {getLevelInfo} from '../../services/levelService';
+import {getResolvableLearnedWordsCount} from '../../services/vocabularyService';
 
 function getAuthService() {
   try {
@@ -20,167 +30,305 @@ function getAuthService() {
   }
 }
 
+const ICON_STAT = 30;
+const ICON_FEATURE = 26;
+const ICON_PROFILE = 20;
+const ICON_MENU = 18;
+
+/** Thống kê: từ đã học */
+function StatWordsIcon() {
+  return (
+    <View style={homeIconStyles.statIconWrap}>
+      <Feather name="book-open" size={ICON_STAT} color="#2563EB" />
+    </View>
+  );
+}
+
+/** Thống kê: video đã xem */
+function StatVideoIcon() {
+  return (
+    <View style={homeIconStyles.statIconWrap}>
+      <Feather name="video" size={ICON_STAT} color="#16A34A" />
+    </View>
+  );
+}
+
+/** Thống kê: đã đối thoại */
+function StatStreakIcon() {
+  return (
+    <View style={homeIconStyles.statIconWrap}>
+      <Feather name="message-circle" size={ICON_STAT} color={COLORS.PRIMARY} />
+    </View>
+  );
+}
+
+/** Hoạt động / lộ trình */
+function ActivityRowIcon() {
+  return (
+    <Feather name="activity" size={28} color={COLORS.PRIMARY} />
+  );
+}
+
+const homeIconStyles = StyleSheet.create({
+  statIconWrap: {
+    width: 48,
+    height: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 4,
+  },
+});
+
+const TEXT_GRAY_800 = '#1F2937';
+const TEXT_GRAY_500 = '#6B7280';
+const ORANGE_50 = '#FFF7ED';
+const ORANGE_200 = '#FED7AA';
+
 const HomeScreen = () => {
   const navigation = useNavigation();
-  const [selectedFeature, setSelectedFeature] = useState(null);
+  const insets = useSafeAreaInsets();
   const [showProfileMenu, setShowProfileMenu] = useState(false);
-  const [userName, setUserName] = useState('Người dùng');
-  const [isAdminUser, setIsAdminUser] = useState(false);
+  const [userName, setUserName] = useState('Xin chào');
+  const [canAccessAdmin, setCanAccessAdmin] = useState(false);
+  const [animatedValues] = useState({
+    card1: new Animated.Value(0),
+    card2: new Animated.Value(0),
+    card3: new Animated.Value(0),
+  });
 
-  // Hàm xử lý đăng xuất
+  const [progress, setProgress] = useState({
+    wordsLearned: 0,
+    videosWatched: 0,
+    dialoguesCompleted: 0,
+    totalXP: 0,
+    level: 'Sơ cấp',
+  });
   const handleLogout = useCallback(async () => {
     setShowProfileMenu(false);
+    // Xóa data cần UID còn hoạt động; signOut trước có thể làm `_uid` về null.
+    await clearAllData();
     const auth = getAuthService();
     if (auth) {
       await auth.signOut();
     }
-    await clearAllData();
   }, []);
 
-  // Hàm điều hướng đến các màn hình tính năng
-  const navigateToFeature = (featureId) => {
-    if (featureId === 1) {
-      navigation.navigate('Vocabulary');
-    } else if (featureId === 2) {
-      navigation.navigate('VideoSelection');
-    } else if (featureId === 3) {
-      navigation.navigate('DialogueIntro');
+  const refreshUserName = useCallback(async () => {
+    const authSvc = getAuthService();
+    let name = '';
+    try {
+      const ud = await getUserData();
+      if (ud && typeof ud === 'object') {
+        name =
+          String(ud.displayName || ud.name || '').trim() ||
+          (typeof ud.fullName === 'string' ? ud.fullName.trim() : '') ||
+          String(ud.nickname || ud.username || ud.profileName || '').trim();
+      }
+    } catch (_) {}
+    // Đọc lại sau getUserData — lúc vào màn Auth có thể chưa restore, sau vài trăm ms mới có user.
+    const user = authSvc?.getCurrentUser?.() ?? null;
+    if (!name && user?.displayName) {
+      name = String(user.displayName).trim();
     }
-  }
+    if (!name && user && !user.isAnonymous && user.email) {
+      name = user.email.split('@')[0] || '';
+    }
+    if (!name && user?.uid) {
+      name = String(user.uid).slice(0, 6);
+    }
+    setUserName(name || 'Xin chào');
+  }, []);
 
-  // Dữ liệu tiến độ học tập
-  const [progress, setProgress] = useState({
-    wordsLearned: 0,
-    lessonsCompleted: 0,
-    currentStreak: 0,
-    totalXP: 0,
-    level: "Sơ cấp",
-  })
+  const navigateToFeature = id => {
+    if (id === 1) {
+      navigation.getParent()?.navigate('VocabularyTab');
+    } else if (id === 2) {
+      navigation.getParent()?.navigate('VideoTab');
+    }
+  };
 
-  // Load tiến độ học tập từ storage + cập nhật tên user
+  useEffect(() => {
+    let unsub = () => {};
+    try {
+      const rnAuth = require('@react-native-firebase/auth').default;
+      unsub = rnAuth().onAuthStateChanged(() => {
+        refreshUserName();
+      });
+    } catch (_) {
+      refreshUserName();
+    }
+    return () => unsub();
+  }, [refreshUserName]);
+
   useFocusEffect(
     React.useCallback(() => {
       loadProgress();
       const auth = getAuthService();
-      const user = auth ? auth.getCurrentUser() : null;
-      const canAccessAdmin = auth?.isCurrentUserAdmin ? auth.isCurrentUserAdmin() : false;
-      setIsAdminUser(Boolean(canAccessAdmin));
-      if (user && !user.isAnonymous && user.email) {
-        const shortName = user.email.split('@')[0] || 'Người dùng';
-        setUserName(shortName);
-      } else {
-        setUserName('Người dùng');
-      }
-    }, []),
+      const canOpenAdmin = auth?.canAccessAdminPanel
+        ? auth.canAccessAdminPanel()
+        : auth?.isCurrentUserAdmin
+          ? auth.isCurrentUserAdmin()
+          : false;
+      setCanAccessAdmin(Boolean(canOpenAdmin));
+
+      refreshUserName();
+
+      Animated.stagger(150, [
+        Animated.spring(animatedValues.card1, {
+          toValue: 1,
+          useNativeDriver: true,
+        }),
+        Animated.spring(animatedValues.card2, {
+          toValue: 1,
+          useNativeDriver: true,
+        }),
+        Animated.spring(animatedValues.card3, {
+          toValue: 1,
+          useNativeDriver: true,
+        }),
+      ]).start();
+    }, [animatedValues, refreshUserName]),
   );
 
   const loadProgress = async () => {
     try {
-      const learnedCount = await getLearnedWordsCount();
-      const savedProgress = await getLearningProgress();
-      
+      let savedProgress = await getLearningProgress({source: 'server'});
+      if (savedProgress == null) {
+        savedProgress = await getLearningProgress();
+      }
+      let learnedCount = 0;
+      try {
+        learnedCount = await getResolvableLearnedWordsCount();
+      } catch (_) {
+        learnedCount = Array.isArray(savedProgress?.wordsLearned)
+          ? savedProgress.wordsLearned.length
+          : 0;
+      }
+      const dialoguesCompletedCount = Array.isArray(savedProgress?.dialoguesCompleted)
+        ? savedProgress.dialoguesCompleted.length
+        : 0;
+      const videosWatchedCount = Array.isArray(savedProgress?.videosWatched)
+        ? savedProgress.videosWatched.length
+        : 0;
+
       setProgress({
         wordsLearned: learnedCount,
-        lessonsCompleted: savedProgress?.lessonsCompleted?.length || 0,
-        currentStreak: savedProgress?.currentStreak || 0,
+        videosWatched: videosWatchedCount,
+        dialoguesCompleted: dialoguesCompletedCount,
         totalXP: savedProgress?.totalXP || 0,
-        level: savedProgress?.level || "Sơ cấp",
+        level: savedProgress?.level || 'Sơ cấp',
       });
+
     } catch (error) {
       console.error('Error loading progress:', error);
     }
   };
 
-  const features = [
-    {
-      id: 1,
-      title: "Học từ vựng",
-      description: "Mở rộng vốn từ",
-      icon: "📚",
-      color: COLORS.PRIMARY,
-    },
-    {
-      id: 2,
-      title: "Học qua Video",
-      description: "Xem video và luyện tập",
-      icon: "🎬",
-      color: COLORS.PRIMARY,
-    },
-    {
-      id: 3,
-      title: "Thực hành hội thoại",
-      description: "Nhập vai trong tình huống thực tế",
-      icon: "💬",
-      color: COLORS.PRIMARY,
-    },
-  ]
+  const levelInfo = getLevelInfo(progress.totalXP || 0);
 
-  const totalXP = progress.totalXP || 0;
-  let levelMin = 0;
-  let levelMax = 100;
-  if (totalXP < 100) {
-    levelMin = 0;
-    levelMax = 100;
-  } else if (totalXP < 300) {
-    levelMin = 100;
-    levelMax = 300;
-  } else {
-    levelMin = 300;
-    levelMax = 600;
-  }
-  const levelRange = levelMax - levelMin || 1;
-  const inLevelXP = Math.min(Math.max(totalXP - levelMin, 0), levelRange);
-  const levelProgressPercent = Math.round((inLevelXP / levelRange) * 100);
+  const getCardStyle = animatedValue => ({
+    transform: [
+      {
+        scale: animatedValue.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0.8, 1],
+        }),
+      },
+      {
+        translateY: animatedValue.interpolate({
+          inputRange: [0, 1],
+          outputRange: [20, 0],
+        }),
+      },
+    ],
+    opacity: animatedValue,
+  });
+
+  const xpDenom = levelInfo.maxXP - levelInfo.minXP;
+  const xpLabel = levelInfo.isMaxLevel
+    ? `${levelInfo.inLevelXP}+ XP`
+    : `${levelInfo.inLevelXP}/${xpDenom}`;
+
+  const headerTopPad = Math.max(
+    insets.top,
+    Platform.OS === 'android' ? StatusBar.currentHeight || 0 : 0,
+  ) + 8;
 
   return (
-    <SafeAreaView style={styles.container}>
-      <ScrollView style={styles.scrollView} showsVerticalScrollIndicator={false} bounces={true}>
-        <View style={styles.headerGradient}>
-          <View style={styles.headerContent}>
-            <View style={styles.headerTop}>
-              <Text style={styles.greeting}>Xin chào, {userName}! 👋</Text>
+    <SafeAreaView style={styles.container} edges={['bottom', 'left', 'right']}>
+      <StatusBar
+        barStyle="light-content"
+        backgroundColor={COLORS.PRIMARY}
+        translucent={Platform.OS === 'android'}
+      />
+      <ScrollView
+        style={styles.scrollView}
+        showsVerticalScrollIndicator={false}
+        bounces>
+        {/* Header cam đặc — giống mock (không gradient) */}
+        <View style={[styles.headerSolid, {paddingTop: headerTopPad}]}>
+          <View style={styles.headerRow}>
+            <TouchableOpacity
+              style={styles.headerNotebookBtn}
+              onPress={() => navigation.navigate('LearnedVocabulary')}
+              activeOpacity={0.75}
+              accessibilityLabel="Danh sách từ vựng đã học">
+              <Feather name="book" size={22} color="#FFFFFF" />
+            </TouchableOpacity>
+            <View style={styles.headerRight}>
+              <Text style={styles.headerUserName} numberOfLines={1}>
+                {userName}
+              </Text>
               <View style={styles.profileButtonContainer}>
                 <TouchableOpacity
                   style={styles.profileButton}
                   onPress={() => setShowProfileMenu(!showProfileMenu)}
                   activeOpacity={0.7}>
-                  <Text style={styles.profileIcon}>👤</Text>
+                  <Feather name="user" size={ICON_PROFILE} color="#FFFFFF" />
                 </TouchableOpacity>
-                
-                {/* Profile Menu */}
+
                 {showProfileMenu && (
                   <View style={styles.profileMenu}>
-                <TouchableOpacity
-                  style={styles.profileMenuItem}
-                  onPress={() => {
-                    setShowProfileMenu(false)
-                    navigation.navigate('Profile')
-                  }}
-                  activeOpacity={0.7}>
-                      <Text style={styles.profileMenuIcon}>👤</Text>
+                    <TouchableOpacity
+                      style={styles.profileMenuItem}
+                      onPress={() => {
+                        setShowProfileMenu(false);
+                        navigation.navigate('Profile');
+                      }}
+                      activeOpacity={0.7}>
+                      <Feather name="user" size={ICON_MENU} color={COLORS.TEXT} style={styles.profileMenuIconFeather} />
                       <Text style={styles.profileMenuText}>Hồ sơ</Text>
                     </TouchableOpacity>
+
                     <View style={styles.profileMenuDivider} />
-                    {isAdminUser && (
+
+                    {canAccessAdmin && (
                       <>
                         <TouchableOpacity
                           style={styles.profileMenuItem}
                           onPress={() => {
-                            setShowProfileMenu(false)
-                            navigation.navigate('Admin')
+                            setShowProfileMenu(false);
+                            const tabNav = navigation.getParent();
+                            const rootNav = tabNav?.getParent();
+                            if (rootNav) {
+                              rootNav.navigate('Admin');
+                            }
                           }}
                           activeOpacity={0.7}>
-                          <Text style={styles.profileMenuIcon}>🛠️</Text>
-                          <Text style={styles.profileMenuText}>Quản trị dữ liệu</Text>
+                          <Feather name="settings" size={ICON_MENU} color={COLORS.TEXT} style={styles.profileMenuIconFeather} />
+                          <Text style={styles.profileMenuText}>
+                            Quản trị dữ liệu
+                          </Text>
                         </TouchableOpacity>
                         <View style={styles.profileMenuDivider} />
                       </>
                     )}
+
                     <TouchableOpacity
                       style={styles.profileMenuItem}
                       onPress={handleLogout}
                       activeOpacity={0.7}>
-                      <Text style={styles.profileMenuIcon}>🚪</Text>
+                      <Feather name="log-out" size={ICON_MENU} color={COLORS.TEXT} style={styles.profileMenuIconFeather} />
                       <Text style={styles.profileMenuText}>Đăng xuất</Text>
                     </TouchableOpacity>
                   </View>
@@ -188,132 +336,102 @@ const HomeScreen = () => {
               </View>
             </View>
           </View>
-          <View style={styles.headerDecor} />
         </View>
 
-        <View style={styles.statsSection}>
-          <Text style={styles.sectionTitle}>Tiến độ học tập</Text>
-          <View style={styles.statsContainer}>
-            {/* Stat Card 1 */}
-            <View style={[styles.statCard, {backgroundColor: COLORS.PRIMARY_DARK}]}>
-              <Text style={styles.statIcon}>📚</Text>
-              <Text style={styles.statNumber}>{progress.wordsLearned}</Text>
-              <Text style={styles.statLabelWhite}>Từ vựng</Text>
-            </View>
+        <View style={styles.quickStatsSection}>
+          <Animated.View
+            style={[styles.quickStatCard, getCardStyle(animatedValues.card1)]}>
+            <StatWordsIcon />
+            <Text style={styles.quickStatNumber}>{progress.wordsLearned}</Text>
+            <Text style={styles.quickStatLabel}>Từ đã học</Text>
+          </Animated.View>
 
-            {/* Stat Card 2 */}
-            <View style={[styles.statCard, {backgroundColor: COLORS.PRIMARY_DARK}]}>
-              <Text style={styles.statIcon}>📖</Text>
-              <Text style={styles.statNumber}>{progress.lessonsCompleted}</Text>
-              <Text style={styles.statLabelWhite}>Bài học</Text>
+          <Animated.View
+            style={[styles.quickStatCard, getCardStyle(animatedValues.card2)]}>
+            <StatVideoIcon />
+            <Text style={styles.quickStatNumber}>
+              {progress.videosWatched}
+            </Text>
+            <Text style={styles.quickStatLabel}>Video đã xem</Text>
+          </Animated.View>
+
+          <Animated.View
+            style={[styles.quickStatCard, getCardStyle(animatedValues.card3)]}>
+            <StatStreakIcon />
+            <Text style={styles.quickStatNumber}>
+              {progress.dialoguesCompleted}
+            </Text>
+            <Text style={styles.quickStatLabel}>Đã đối thoại</Text>
+          </Animated.View>
+        </View>
+
+        <View style={styles.card}>
+          <View style={styles.cardHeaderRow}>
+            <Text style={styles.cardTitle}>Cấp độ hiện tại</Text>
+            <View style={styles.currentLevelBadge}>
+              <Text style={styles.currentLevelBadgeText}>
+                Cấp {levelInfo.levelIndex + 1}
+              </Text>
             </View>
           </View>
 
-          <View style={[styles.levelBadge, {backgroundColor: COLORS.BACKGROUND}]}>
-            <View style={styles.levelBadgeContent}>
-              <Text style={styles.levelLabel}>Cấp độ hiện tại</Text>
-              <Text style={styles.levelValue}>{progress.level || 'Sơ cấp'}</Text>
-              <View style={styles.levelXpRow}>
-                <View style={styles.levelXpBarBackground}>
-                  <View
-                    style={[
-                      styles.levelXpBarFill,
-                      {width: `${levelProgressPercent}%`},
-                    ]}
-                  />
-                </View>
-                <Text style={styles.levelXpText}>
-                  {progress.totalXP || 0} XP
-                </Text>
-              </View>
-            </View>
+          <View style={styles.progressTrack}>
+            <View
+              style={[
+                styles.progressFillSolid,
+                {width: `${levelInfo.progressPercent}%`},
+              ]}
+            />
           </View>
 
-          {/* Nút xem lộ trình chi tiết */}
+          <View style={styles.levelFooterRow}>
+            <Text style={styles.cardSubtitle}>
+              {levelInfo.isMaxLevel
+                ? 'Bạn đã đạt cấp độ tối đa 🎉'
+                : `Tới cấp độ ${levelInfo.levelIndex + 2}`}
+            </Text>
+            <Text style={styles.levelXpHighlight}>{xpLabel}</Text>
+          </View>
+        </View>
+
+        <View style={styles.card}>
           <TouchableOpacity
-            style={styles.learningPathButton}
+            style={styles.rowCard}
             activeOpacity={0.8}
             onPress={() => navigation.navigate('LearningPath')}>
-            <Text style={styles.learningPathIcon}>📈</Text>
-            <View style={styles.learningPathTextWrapper}>
-              <Text style={styles.learningPathTitle}>Hoạt động của tôi</Text>
-              <Text style={styles.learningPathSubtitle}>
-                Thống kê từ đã học và video đã xem
-              </Text>
-            </View>
-          </TouchableOpacity>
-
-          {/* Nút xem từ yêu thích */}
-          <TouchableOpacity
-            style={styles.learningPathButton}
-            activeOpacity={0.8}
-            onPress={() => navigation.navigate('MyVocabulary')}>
-            <Text style={styles.learningPathIcon}>★</Text>
-            <View style={styles.learningPathTextWrapper}>
-              <Text style={styles.learningPathTitle}>Từ vựng của tôi</Text>
-              <Text style={styles.learningPathSubtitle}>
-                Xem danh sách từ đã yêu thích
-              </Text>
-            </View>
+            <ActivityRowIcon />
+            <Text style={styles.rowCardTitle}>Hoạt động của tôi</Text>
           </TouchableOpacity>
         </View>
 
-        <View style={styles.section}>
-          <View style={styles.sectionHeader}>
-            <Text style={styles.sectionTitle}>Tính năng học tập</Text>
-            <TouchableOpacity>
-              <Text style={styles.seeAllText}>Xem tất cả →</Text>
-            </TouchableOpacity>
-          </View>
+        <View style={styles.sectionBlock}>
+          <Text style={styles.sectionHeading}>Tính năng học tập</Text>
+          <TouchableOpacity
+            style={styles.featureChip}
+            activeOpacity={0.85}
+            onPress={() => navigateToFeature(1)}>
+            <View style={styles.featureChipIconWrap}>
+              <Feather name="book-open" size={ICON_FEATURE} color={COLORS.PRIMARY} />
+            </View>
+            <Text style={styles.featureChipText}>Học từ vựng</Text>
+          </TouchableOpacity>
 
-          <View style={styles.featuresGrid}>
-            {features.map((feature, index) => {
-              const isLastOdd = features.length % 2 === 1 && index === features.length - 1
-              return (
-              <TouchableOpacity
-                key={feature.id}
-                onPress={() => {
-                  setSelectedFeature(feature.id);
-                  navigateToFeature(feature.id);
-                }}
-                activeOpacity={0.8}
-                style={[
-                  styles.featureCardWrapper,
-                  isLastOdd && styles.featureCardWrapperLastOdd,
-                  selectedFeature === feature.id && styles.featureCardActive,
-                ]}
-              >
-                <View
-                  style={[
-                    styles.featureCard,
-                    isLastOdd && styles.featureCardLastOdd,
-                    {backgroundColor: feature.color},
-                  ]}>
-                  <Text style={styles.featureIcon}>{feature.icon}</Text>
-                  <Text
-                    style={styles.featureTitle}
-                    numberOfLines={1}
-                    ellipsizeMode="tail">
-                    {feature.title}
-                  </Text>
-                  <Text
-                    style={styles.featureDescription}
-                    numberOfLines={2}
-                    ellipsizeMode="tail">
-                    {feature.description}
-                  </Text>
-                </View>
-              </TouchableOpacity>
-              )
-            })}
-          </View>
+          <TouchableOpacity
+            style={styles.featureChip}
+            activeOpacity={0.85}
+            onPress={() => navigateToFeature(2)}>
+            <View style={styles.featureChipIconWrap}>
+              <Feather name="video" size={ICON_FEATURE} color={COLORS.PRIMARY} />
+            </View>
+            <Text style={styles.featureChipText}>Học qua video</Text>
+          </TouchableOpacity>
         </View>
 
         <View style={styles.bottomSpacing} />
       </ScrollView>
     </SafeAreaView>
-  )
-}
+  );
+};
 
 const styles = StyleSheet.create({
   container: {
@@ -323,310 +441,225 @@ const styles = StyleSheet.create({
   scrollView: {
     flex: 1,
   },
-  // Header Styles - Đồng nhất
-  headerGradient: {
-    paddingHorizontal: 20,
-    paddingTop: 20,
-    paddingBottom: 30,
-    position: "relative",
-    overflow: "visible",
+  headerSolid: {
     backgroundColor: COLORS.PRIMARY,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+    paddingBottom: 28,
   },
-  headerDecor: {
-    position: "absolute",
-    right: -40,
-    top: -40,
-    width: 200,
-    height: 200,
-    borderRadius: 100,
-    backgroundColor: "rgba(255, 255, 255, 0.1)",
+  headerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 12,
   },
-  headerContent: {
-    position: "relative",
-    zIndex: 1,
-  },
-  headerTop: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-  },
-  greeting: {
-    fontSize: 22,
-    fontWeight: "bold",
-    color: COLORS.BACKGROUND_WHITE,
-    flex: 1,
-  },
-  // Profile Button & Menu - Đồng nhất
-  profileButtonContainer: {
-    position: "relative",
-    marginLeft: 12,
-  },
-  profileButton: {
+  headerNotebookBtn: {
     width: 40,
     height: 40,
     borderRadius: 20,
-    backgroundColor: "rgba(255, 255, 255, 0.2)",
-    justifyContent: "center",
-    alignItems: "center",
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
-  profileIcon: {
-    fontSize: 20,
+  headerRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+    justifyContent: 'flex-end',
+    minWidth: 0,
+  },
+  headerUserName: {
+    flexShrink: 1,
+    fontSize: 13,
+    fontWeight: '500',
+    color: '#FFFFFF',
+    maxWidth: '70%',
+  },
+  profileButtonContainer: {
+    position: 'relative',
+  },
+  profileButton: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#3B82F6',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   profileMenu: {
-    position: "absolute",
-    top: 45,
+    position: 'absolute',
+    top: 48,
     right: 0,
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 16,
+    borderRadius: THEME.radius.lg,
     paddingVertical: 8,
     minWidth: 160,
-    shadowColor: COLORS.TEXT,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    elevation: 8,
+    ...THEME.shadow.floating,
     zIndex: 1000,
   },
   profileMenuItem: {
-    flexDirection: "row",
-    alignItems: "center",
+    flexDirection: 'row',
+    alignItems: 'center',
     paddingHorizontal: 16,
     paddingVertical: 12,
   },
-  profileMenuIcon: {
-    fontSize: 18,
+  profileMenuIconFeather: {
     marginRight: 12,
   },
   profileMenuText: {
     fontSize: 15,
     color: COLORS.TEXT,
-    fontWeight: "500",
+    fontWeight: '500',
   },
   profileMenuDivider: {
     height: 1,
     backgroundColor: COLORS.BORDER,
     marginVertical: 4,
   },
-  // Stats Section - Đồng nhất
-  statsSection: {
-    paddingHorizontal: 20,
-    paddingVertical: 20,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
+
+  quickStatsSection: {
+    flexDirection: 'row',
+    paddingHorizontal: 16,
     marginTop: -20,
-    marginHorizontal: 16,
-    borderRadius: 20,
-    marginBottom: 16,
-    shadowColor: COLORS.TEXT,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 12,
-    elevation: 6,
+    marginBottom: 20,
+    gap: 10,
   },
-  sectionTitle: {
-    fontSize: 20,
-    fontWeight: "bold",
-    color: COLORS.TEXT,
-    marginBottom: 16,
-  },
-  statsContainer: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginBottom: 16,
-    gap: 12,
-  },
-  statCard: {
+  quickStatCard: {
     flex: 1,
+    backgroundColor: '#FFFFFF',
     borderRadius: 16,
-    padding: 16,
-    alignItems: "center",
-    shadowColor: COLORS.TEXT,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  statIcon: {
-    fontSize: 32,
-    marginBottom: 10,
-  },
-  statNumber: {
-    fontSize: 24,
-    fontWeight: "bold",
-    color: COLORS.BACKGROUND_WHITE,
-    marginBottom: 4,
-  },
-  statLabelWhite: {
-    fontSize: 12,
-    color: "rgba(255, 255, 255, 0.9)",
-    fontWeight: "600",
-  },
-  levelBadge: {
-    flexDirection: "row",
-    justifyContent: "flex-start",
-    alignItems: "center",
-    borderRadius: 16,
-    padding: 16,
-    shadowColor: COLORS.PRIMARY_DARK,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.2,
-    shadowRadius: 8,
-    elevation: 4,
-  },
-  levelBadgeContent: {
-    flex: 1,
-  },
-  levelLabel: {
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-    marginBottom: 4,
-    fontWeight: "500",
-  },
-  levelValue: {
-    fontSize: 20,
-    fontWeight: "bold",
-    color: COLORS.TEXT,
-    marginBottom: 6,
-  },
-  streakText: {
-    fontSize: 13,
-    color: "rgba(255, 255, 255, 0.9)",
-    fontWeight: "600",
-  },
-  progressCircle: {
-    display: 'none',
-  },
-  progressPercent: {
-    fontSize: 16,
-    fontWeight: "bold",
-    color: COLORS.TEXT,
-  },
-  levelXpRow: {
-    flexDirection: 'row',
+    paddingVertical: 14,
+    paddingHorizontal: 6,
     alignItems: 'center',
-    marginTop: 8,
-    gap: 8,
-  },
-  levelXpBarBackground: {
-    flex: 1,
-    height: 6,
-    borderRadius: 999,
-    backgroundColor: COLORS.BORDER,
-    overflow: 'hidden',
-  },
-  levelXpBarFill: {
-    height: '100%',
-    backgroundColor: COLORS.PRIMARY_DARK,
-    borderRadius: 999,
-  },
-  levelXpText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: COLORS.TEXT_SECONDARY,
-  },
-  learningPathButton: {
-    marginTop: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: 12,
-    backgroundColor: COLORS.BACKGROUND,
-  },
-  learningPathIcon: {
-    fontSize: 22,
-    marginRight: 10,
-  },
-  learningPathTextWrapper: {
-    flex: 1,
-  },
-  learningPathTitle: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: COLORS.TEXT,
-    marginBottom: 2,
-  },
-  learningPathSubtitle: {
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-  },
-  // Section Styles - Đồng nhất
-  section: {
-    paddingHorizontal: 20,
-    paddingVertical: 20,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    marginHorizontal: 16,
-    borderRadius: 20,
-    marginBottom: 16,
-    shadowColor: COLORS.TEXT,
-    shadowOffset: { width: 0, height: 4 },
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 2},
     shadowOpacity: 0.08,
-    shadowRadius: 12,
-    elevation: 4,
+    shadowRadius: 6,
+    elevation: 3,
   },
-  sectionHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: 16,
-  },
-  seeAllText: {
-    fontSize: 14,
+  quickStatNumber: {
+    fontSize: 28,
+    fontWeight: '700',
     color: COLORS.PRIMARY,
-    fontWeight: "600",
+    marginBottom: 4,
   },
-  // Feature Cards - Đồng nhất
-  featuresGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    justifyContent: "space-between",
+  quickStatLabel: {
+    fontSize: 12,
+    color: TEXT_GRAY_500,
   },
-  featureCardWrapper: {
-    width: "48%",
+
+  card: {
+    marginHorizontal: 16,
+    marginBottom: 16,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 16,
+    padding: 20,
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 2},
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 3,
+  },
+  cardHeaderRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     marginBottom: 12,
   },
-  featureCardWrapperLastOdd: {
-    width: "100%",
-    alignItems: "center",
+  cardTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: TEXT_GRAY_800,
   },
-  featureCardActive: {
-    transform: [{ scale: 0.95 }],
+  currentLevelBadge: {
+    backgroundColor: COLORS.PRIMARY,
+    paddingHorizontal: 16,
+    paddingVertical: 6,
+    borderRadius: 999,
   },
-  featureCard: {
-    borderRadius: 16,
-    padding: 16,
-    alignItems: "center",
-    height: 150,
-    justifyContent: "center",
-    shadowColor: COLORS.TEXT,
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.1,
-    shadowRadius: 8,
-    elevation: 4,
+  currentLevelBadgeText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#FFFFFF',
   },
-  featureCardLastOdd: {
-    width: "48%",
+  progressTrack: {
+    height: 12,
+    borderRadius: 999,
+    backgroundColor: COLORS.PRIMARY_SOFT,
+    overflow: 'hidden',
   },
-  featureIcon: {
-    fontSize: 36,
-    marginBottom: 10,
+  progressFillSolid: {
+    height: '100%',
+    backgroundColor: COLORS.PRIMARY,
+    borderRadius: 999,
   },
-  featureTitle: {
-    fontSize: 15,
-    fontWeight: "bold",
-    color: COLORS.BACKGROUND_WHITE,
-    marginBottom: 4,
-    textAlign: "center",
+  levelFooterRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 10,
   },
-  featureDescription: {
+  cardSubtitle: {
+    flex: 1,
     fontSize: 12,
-    color: "rgba(255, 255, 255, 0.85)",
-    lineHeight: 16,
-    textAlign: "center",
-    fontWeight: "500",
+    color: TEXT_GRAY_500,
+    marginRight: 8,
   },
-  bottomSpacing: {
-    height: 20,
+  levelXpHighlight: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: COLORS.PRIMARY,
   },
-})
 
-export default HomeScreen
+  rowCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 14,
+  },
+  rowCardTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: TEXT_GRAY_800,
+  },
+
+  sectionBlock: {
+    paddingHorizontal: 16,
+    marginBottom: 24,
+  },
+  sectionHeading: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: TEXT_GRAY_800,
+    marginBottom: 12,
+  },
+  featureChip: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 16,
+    paddingHorizontal: 20,
+    borderRadius: 999,
+    backgroundColor: ORANGE_50,
+    borderWidth: 2,
+    borderColor: ORANGE_200,
+    width: '100%',
+    marginBottom: 12,
+  },
+  featureChipIconWrap: {
+    width: 32,
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 12,
+  },
+  featureChipText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: COLORS.PRIMARY,
+  },
+
+  bottomSpacing: {
+    height: 28,
+  },
+});
+
+export default HomeScreen;

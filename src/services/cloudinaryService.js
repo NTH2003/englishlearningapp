@@ -1,76 +1,58 @@
 import {CLOUDINARY} from '../constants';
 
-function _buildEndpoint(resourceType = 'image') {
+function buildUploadUrl(resourceType) {
   return `https://api.cloudinary.com/v1_1/${CLOUDINARY.CLOUD_NAME}/${resourceType}/upload`;
 }
 
-function _guessMimeType(filePath, resourceType) {
-  const lower = (filePath || '').toLowerCase();
-  if (resourceType === 'video') {
-    if (lower.endsWith('.mov')) return 'video/quicktime';
-    if (lower.endsWith('.webm')) return 'video/webm';
-    return 'video/mp4';
-  }
-  if (lower.endsWith('.png')) return 'image/png';
-  if (lower.endsWith('.webp')) return 'image/webp';
-  return 'image/jpeg';
-}
-
-async function _upload(filePath, resourceType = 'image') {
-  if (!filePath) {
-    return {ok: false, error: 'Đường dẫn file rỗng.'};
+/**
+ * Upload file lên Cloudinary (unsigned preset).
+ * @param {{ uri: string, type?: string, fileName?: string }} file — uri từ image-picker / DocumentPicker
+ * @param {'video'|'image'} resourceType
+ * @returns {Promise<{ok: boolean, url?: string, publicId?: string, error?: string}>}
+ */
+export async function uploadToCloudinary(file, resourceType) {
+  const uri = file?.uri;
+  if (!uri || typeof uri !== 'string') {
+    return {ok: false, error: 'Thiếu đường dẫn file.'};
   }
 
-  const endpoint = _buildEndpoint(resourceType);
+  const name =
+    file.fileName ||
+    (resourceType === 'video' ? 'upload.mp4' : 'upload.jpg');
+  const mime =
+    file.type ||
+    (resourceType === 'video' ? 'video/mp4' : 'image/jpeg');
+
   const formData = new FormData();
+  formData.append('file', {uri, type: mime, name});
   formData.append('upload_preset', CLOUDINARY.UPLOAD_PRESET);
 
-  const hasUriScheme =
-    filePath.startsWith('file://') ||
-    filePath.startsWith('content://') ||
-    filePath.startsWith('ph://') ||
-    filePath.startsWith('assets-library://');
-  const safeUri = hasUriScheme ? filePath : `file://${filePath}`;
-  formData.append('file', {
-    uri: safeUri,
-    type: _guessMimeType(filePath, resourceType),
-    name: `${resourceType}_${Date.now()}`,
-  });
-
   try {
-    const res = await fetch(endpoint, {
+    const res = await fetch(buildUploadUrl(resourceType), {
       method: 'POST',
       body: formData,
     });
-    const json = await res.json();
-
-    if (!res.ok || json?.error) {
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
       return {
         ok: false,
-        error: json?.error?.message || 'Upload Cloudinary thất bại.',
+        error: json?.error?.message || `Upload thất bại (${res.status}).`,
       };
     }
-
+    const url = json?.secure_url || json?.url;
+    if (!url) {
+      return {ok: false, error: 'Cloudinary không trả về URL.'};
+    }
     return {
       ok: true,
-      url: json.secure_url,
-      publicId: json.public_id,
-      resourceType: json.resource_type,
-      format: json.format,
-      width: json.width,
-      height: json.height,
-      duration: json.duration,
+      url: String(url),
+      publicId: json?.public_id != null ? String(json.public_id) : undefined,
     };
   } catch (e) {
     return {ok: false, error: e?.message || 'Lỗi mạng khi upload Cloudinary.'};
   }
 }
 
-export async function uploadImageToCloudinary(filePath) {
-  return _upload(filePath, 'image');
+export async function uploadVideoToCloudinary(file) {
+  return uploadToCloudinary(file, 'video');
 }
-
-export async function uploadVideoToCloudinary(filePath) {
-  return _upload(filePath, 'video');
-}
-

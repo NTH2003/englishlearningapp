@@ -66,6 +66,10 @@ yarn-error.log
 # testing
 /coverage
 
+# Biến môi trường local (giữ file .env.example làm mẫu)
+.env
+server/.env
+
 # Yarn
 .yarn/*
 !.yarn/patches

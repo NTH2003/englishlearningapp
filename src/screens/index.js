@@ -3,23 +3,30 @@
  * Cấu trúc thư mục:
  *   auth/     – Đăng nhập, Đăng ký
  *   main/     – Trang chủ, Hồ sơ, Hoạt động của tôi
- *   vocabulary/ – Học từ vựng (chủ đề, flashcard, quiz, gõ từ, nghe, từ của tôi)
+ *   vocabulary/ – Học từ vựng (chủ đề, flashcard, quiz, gõ từ, nghe)
  *   video/    – Chọn video, Xem video
  *   dialogue/ – Giới thiệu hội thoại, Thực hành hội thoại
  *   lesson/   – Chi tiết bài học
  */
 
 export { LoginScreen, RegisterScreen } from './auth';
-export { HomeScreen, ProfileScreen, LearningPathScreen, AdminScreen } from './main';
 export {
+  HomeScreen,
+  ProfileScreen,
+  LearningPathScreen,
+  LearnedVocabularyScreen,
+  AdminScreen,
+} from './main';
+export {
+  VocabularyRootScreen,
   TopicSelectionScreen,
-  StudyModeSelectionScreen,
   VocabularyFlashcardScreen,
+  FlashcardResultScreen,
   VocabularyQuizScreen,
   VocabularyTypingScreen,
   VocabularyListeningScreen,
-  MyVocabularyScreen,
-  ReviewSessionScreen,
+  VocabularyQuickChallengeScreen,
+  VideoVocabularyStudyModeScreen,
 } from './vocabulary';
 export { VideoSelectionScreen, VideoLearningScreen } from './video';
 export { DialogueIntroScreen, DialoguePracticeScreen } from './dialogue';

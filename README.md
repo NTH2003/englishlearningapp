@@ -64,6 +64,12 @@ EnglishLearningApp/
 - `npm test` - Chạy tests
 - `npm run lint` - Kiểm tra code style
 
+### Icon thanh tab (Feather)
+
+Tab bar dùng **`react-native-vector-icons`** (bộ **Feather**). Android đã cấu hình `fonts.gradle` chỉ copy `Feather.ttf`. iOS: `Info.plist` đã khai báo `Feather.ttf` — sau khi clone, chạy `cd ios && pod install` nếu build iOS.
+
+Đổi icon: sửa map trong `src/components/TabBarVectorIcons.js` hoặc đổi sang bộ khác (ví dụ `Ionicons`) và thêm file `.ttf` tương ứng trong `android/app/build.gradle` + `Info.plist`.
+
 ## 🔧 Phát triển
 
 ### Thêm màn hình mới

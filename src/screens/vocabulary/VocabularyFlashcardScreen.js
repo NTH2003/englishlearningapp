@@ -1,73 +1,212 @@
-import React, {useState, useEffect, useRef} from 'react';
+import React, {useState, useEffect, useMemo, useRef} from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TouchableOpacity,
-  Image,
   Animated,
   PanResponder,
   Dimensions,
   SafeAreaView,
+  Linking,
+  ScrollView,
+  Platform,
+  StatusBar,
 } from 'react-native';
-import {useNavigation} from '@react-navigation/native';
+import Feather from 'react-native-vector-icons/Feather';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {COLORS} from '../../constants';
-import {markWordAsLearned, isWordLearned} from '../../services/vocabularyService';
+import {
+  markWordAsLearned,
+  isWordLearned,
+  commitFlashcardSessionWords,
+  commitReviewFlashcardSession,
+  getFlashcardSelfReport,
+  buildExplicitChuaBietSetFromStored,
+  buildExplicitChuaBietSetFromReviewWrong,
+} from '../../services/vocabularyService';
 import {getWordMedia} from '../../services/firebaseService';
+import InlineAudioPlayer from '../../components/InlineAudioPlayer';
+
+let Tts = null;
+try {
+  Tts = require('react-native-tts').default;
+} catch (e) {
+  console.warn('react-native-tts không khả dụng:', e?.message);
+}
 
 const {width: SCREEN_WIDTH} = Dimensions.get('window');
 const SWIPE_THRESHOLD = 120;
 
-const VocabularyFlashcardScreen = ({route}) => {
-  const navigation = useNavigation();
-  const {words, topicId} = route.params || {};
+const TEXT_NAVY = '#0F172A';
+const ORANGE_DEEP = '#EA580C';
+const HEADER_ORANGE = COLORS.PRIMARY;
+
+function getPartOfSpeechLabel(word) {
+  if (!word) return 'Từ vựng';
+  if (word.partOfSpeechVi) return word.partOfSpeechVi;
+  return 'Từ vựng';
+}
+
+const VocabularyFlashcardScreen = ({route, navigation}) => {
+  const insets = useSafeAreaInsets();
+  const {words, topicId, topicName, topic} = route.params || {};
+  const topicTitle = topicName || topic?.name || 'Từ vựng';
+  const isReviewSession = topicId === 'review';
+
   const [currentIndex, setCurrentIndex] = useState(0);
   const [isFlipped, setIsFlipped] = useState(false);
-  const [isLearned, setIsLearned] = useState(false);
-  const [learnedWordsInSession, setLearnedWordsInSession] = useState(
-    new Set(),
-  );
+  const [wordStatus, setWordStatus] = useState({});
   const [wordMedia, setWordMedia] = useState(null);
-  
-  const flipAnimation = useRef(new Animated.Value(0)).current;
+  const [ttsAvailable, setTtsAvailable] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  /** Phát file âm thanh trong app (khi không dùng TTS) */
+  const [remoteAudio, setRemoteAudio] = useState({uri: null, key: 0});
+
   const position = useRef(new Animated.ValueXY()).current;
   const opacity = useRef(new Animated.Value(1)).current;
-  const progressAnimation = useRef(new Animated.Value(0)).current;
+  /** Chỉ khi user chủ động bấm "Chưa biết" — kết phiên không coi là đã học. Còn lại (lật thẻ/xem hết) vẫn lưu đã học. */
+  const explicitChuaBietRef = useRef(new Set());
+  /** Từ đã bấm Đã biết / Chưa biết trong phiên — tránh seed async ghi đè lựa chọn vừa chọn. */
+  const userPressedFlashcardRef = useRef(new Set());
+
+  /** Khôi phục “Chưa biết” đã lưu cho cả phiên (kết phiên cần đúng bộ). */
+  useEffect(() => {
+    if (!Array.isArray(words) || !words.length) return;
+    let cancelled = false;
+    userPressedFlashcardRef.current = new Set();
+    const loader = isReviewSession
+      ? buildExplicitChuaBietSetFromReviewWrong(words)
+      : buildExplicitChuaBietSetFromStored(words);
+    loader.then((storedSet) => {
+      if (cancelled) return;
+      const next = new Set(storedSet);
+      for (const w of words) {
+        const sid = String(w.id);
+        if (userPressedFlashcardRef.current.has(sid)) {
+          next.delete(sid);
+          if (explicitChuaBietRef.current.has(sid)) next.add(sid);
+        }
+      }
+      explicitChuaBietRef.current = next;
+      if (isReviewSession) {
+        const st = {};
+        for (const w of words) {
+          const sid = String(w.id);
+          st[sid] = next.has(sid) ? false : true;
+        }
+        setWordStatus(st);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [words, isReviewSession]);
 
   const currentWord = words && words[currentIndex] ? words[currentIndex] : null;
-  
-  // Tính toán tiến độ
-  const progress = words && words.length > 0 ? ((currentIndex + 1) / words.length) * 100 : 0;
+  const totalWords = Array.isArray(words) ? words.length : 0;
 
-  // Cập nhật animation tiến độ
-  useEffect(() => {
-    Animated.timing(progressAnimation, {
-      toValue: progress,
-      duration: 300,
-      useNativeDriver: false,
-    }).start();
-  }, [progress]);
+  /** Trạng thái nút theo đúng từ đang xem — gắn với wordStatus[id], không dùng state riêng (tránh dính từ trước khi đổi thẻ). */
+  const flashcardUiChoice = useMemo(() => {
+    if (!currentWord?.id) return null;
+    const v = wordStatus[String(currentWord.id)];
+    if (v === true) return 'known';
+    if (v === false) return 'unknown';
+    return null;
+  }, [currentWord?.id, wordStatus]);
+
+  const progressRatio =
+    totalWords > 0 ? (currentIndex + 1) / totalWords : 0;
 
   useEffect(() => {
-    // Reset khi chuyển từ
+    try {
+      if (Tts && typeof Tts.setDefaultLanguage === 'function') {
+        Tts.setDefaultLanguage('en-US');
+        Tts.setDefaultRate(0.48);
+        Tts.setDefaultPitch(1.0);
+        setTtsAvailable(true);
+      }
+    } catch (e) {
+      console.warn('TTS init:', e?.message);
+      setTtsAvailable(false);
+    }
+    return () => {
+      try {
+        Tts?.stop?.();
+      } catch (_) {}
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!Tts?.addEventListener) return undefined;
+    const onEnd = () => setIsSpeaking(false);
+    const subFinish = Tts.addEventListener('tts-finish', onEnd);
+    const subCancel = Tts.addEventListener('tts-cancel', onEnd);
+    return () => {
+      try {
+        subFinish?.remove?.();
+        subCancel?.remove?.();
+      } catch (_) {}
+    };
+  }, []);
+
+  useEffect(() => {
     setIsFlipped(false);
-    flipAnimation.setValue(0);
     position.setValue({x: 0, y: 0});
     opacity.setValue(1);
-    
-    // Kiểm tra trạng thái đã học của từ mới
+
+    let cancelled = false;
+    const wordId = currentWord?.id;
+
     const syncStatuses = async () => {
-      if (currentWord) {
-        const learned = await isWordLearned(currentWord.id);
-        setIsLearned(learned);
-        const media = await getWordMedia(currentWord.id);
-        setWordMedia(media);
-      } else {
-        setWordMedia(null);
+      if (!currentWord || wordId == null) {
+        if (!cancelled) {
+          setWordMedia(null);
+        }
+        return;
       }
+      try {
+        const sid = String(currentWord.id);
+        if (isReviewSession) {
+          if (cancelled) return;
+          const media = await getWordMedia(currentWord.id);
+          if (cancelled) return;
+          setWordMedia(media);
+          return;
+        }
+        const report = await getFlashcardSelfReport(currentWord.id);
+        const learnedGlobal = await isWordLearned(currentWord.id);
+        if (cancelled) return;
+
+        let choice = null;
+        if (report === true) choice = 'known';
+        else if (report === false) choice = 'unknown';
+        else if (learnedGlobal) choice = 'known';
+
+        setWordStatus((prev) => ({
+          ...prev,
+          [sid]:
+            choice === 'known' ? true : choice === 'unknown' ? false : undefined,
+        }));
+
+        const media = await getWordMedia(currentWord.id);
+        if (cancelled) return;
+        setWordMedia(media);
+      } catch (_) {}
     };
     syncStatuses();
-  }, [currentIndex, currentWord]);
+    return () => {
+      cancelled = true;
+    };
+  }, [currentIndex, currentWord?.id, isReviewSession]);
+
+  useEffect(() => {
+    try {
+      Tts?.stop?.();
+    } catch (_) {}
+    setIsSpeaking(false);
+    setRemoteAudio({uri: null, key: 0});
+  }, [currentIndex, currentWord?.id]);
 
   const panResponder = useRef(
     PanResponder.create({
@@ -80,14 +219,11 @@ const VocabularyFlashcardScreen = ({route}) => {
       onPanResponderRelease: (evt, gestureState) => {
         if (Math.abs(gestureState.dx) > SWIPE_THRESHOLD) {
           if (gestureState.dx > 0) {
-            // Swipe right - Previous
             handlePrevious();
           } else {
-            // Swipe left - Next
             handleNext();
           }
         } else {
-          // Reset position
           Animated.spring(position, {
             toValue: {x: 0, y: 0},
             useNativeDriver: false,
@@ -98,13 +234,50 @@ const VocabularyFlashcardScreen = ({route}) => {
           }).start();
         }
       },
-    })
+    }),
   ).current;
 
+  /** Một lần ghi wordsLearned + XP — tránh 5 lần lưu tuần tự bị cắt khi thoát app. */
+  const finalizeSessionProgress = () => {
+    if (!Array.isArray(words) || !words.length) return Promise.resolve();
+    if (isReviewSession) {
+      return commitReviewFlashcardSession(words, [
+        ...explicitChuaBietRef.current,
+      ]);
+    }
+    return commitFlashcardSessionWords(words, [
+      ...explicitChuaBietRef.current,
+    ]);
+  };
+
   const handleNext = () => {
+    if (!Array.isArray(words) || !words.length) return;
     if (currentIndex < words.length - 1) {
       setCurrentIndex(currentIndex + 1);
+      return;
     }
+    const finalWordStatus = {};
+    let rem = 0;
+    for (const w of words) {
+      const sid = String(w.id);
+      const known = !explicitChuaBietRef.current.has(sid);
+      finalWordStatus[sid] = known;
+      if (known) rem += 1;
+    }
+    const total = words.length;
+    /** Sang tổng kết ngay — không await lưu (Firebase/getLearningProgress có thể treo → màn hình không mở). */
+    navigation.replace('FlashcardResult', {
+      topicId,
+      topicName,
+      topic,
+      words,
+      wordStatus: finalWordStatus,
+      rememberedCount: rem,
+      notRememberedCount: Math.max(0, total - rem),
+    });
+    finalizeSessionProgress().catch((e) =>
+      console.warn('finalizeSessionProgress', e?.message),
+    );
   };
 
   const handlePrevious = () => {
@@ -115,57 +288,64 @@ const VocabularyFlashcardScreen = ({route}) => {
 
   const handleFlip = () => {
     setIsFlipped(!isFlipped);
-    Animated.spring(flipAnimation, {
-      toValue: isFlipped ? 0 : 1,
-      friction: 8,
-      tension: 10,
-      useNativeDriver: true,
-    }).start();
   };
 
-  const handleToggleLearned = async () => {
+  const handleSetLearned = async (value) => {
     if (!currentWord) return;
-    
-    const newLearnedStatus = !isLearned;
-    setIsLearned(newLearnedStatus);
-    
-    // Cập nhật danh sách từ đã học trong session
-    const newSet = new Set(learnedWordsInSession);
+    const sid = String(currentWord.id);
+    const newLearnedStatus = Boolean(value);
+    userPressedFlashcardRef.current.add(sid);
     if (newLearnedStatus) {
-      newSet.add(currentWord.id);
+      explicitChuaBietRef.current.delete(sid);
     } else {
-      newSet.delete(currentWord.id);
+      explicitChuaBietRef.current.add(sid);
     }
-    setLearnedWordsInSession(newSet);
-    
-    // Lưu vào storage
+    setWordStatus((prev) => ({
+      ...prev,
+      [sid]: newLearnedStatus,
+    }));
+    if (isReviewSession) {
+      return;
+    }
     await markWordAsLearned(currentWord.id, newLearnedStatus);
   };
 
-  const getWordImageSource = () => {
-    if (!currentWord) return null;
-    const image = wordMedia?.imageUrl || currentWord.image || currentWord.imageUri;
-    if (!image) return null;
-    if (typeof image === 'string') return {uri: image};
-    return image; // hỗ trợ require('...') nếu cần
-  };
+  const hasRemoteAudio = Boolean(
+    wordMedia?.audioUrl ||
+      wordMedia?.soundUrl ||
+      currentWord?.audioUrl,
+  );
 
-  const frontInterpolate = flipAnimation.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['0deg', '180deg'],
-  });
+  const canPlayPronunciation = ttsAvailable || hasRemoteAudio;
 
-  const backInterpolate = flipAnimation.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['180deg', '360deg'],
-  });
+  const handlePlayPronunciation = () => {
+    if (!currentWord) return;
+    const audioUrl =
+      wordMedia?.audioUrl ||
+      wordMedia?.soundUrl ||
+      currentWord?.audioUrl;
+    const text = String(currentWord.word || '').trim();
+    if (!text && !audioUrl) return;
 
-  const frontAnimatedStyle = {
-    transform: [{rotateY: frontInterpolate}],
-  };
-
-  const backAnimatedStyle = {
-    transform: [{rotateY: backInterpolate}],
+    if (ttsAvailable && Tts && text) {
+      try {
+        Tts.stop();
+        setIsSpeaking(true);
+        Tts.speak(text);
+      } catch (e) {
+        setIsSpeaking(false);
+        if (audioUrl) {
+          setRemoteAudio((a) => ({uri: audioUrl, key: a.key + 1}));
+          setIsSpeaking(true);
+        }
+      }
+      return;
+    }
+    if (audioUrl) {
+      setRemoteAudio((a) => ({uri: audioUrl, key: a.key + 1}));
+      setIsSpeaking(true);
+      return;
+    }
   };
 
   if (!currentWord) {
@@ -178,200 +358,210 @@ const VocabularyFlashcardScreen = ({route}) => {
     );
   }
 
-  const progressWidth = progressAnimation.interpolate({
-    inputRange: [0, 100],
-    outputRange: ['0%', '100%'],
-  });
-
   return (
     <SafeAreaView style={styles.container}>
-      {/* Header */}
-      <View style={styles.header}>
+      <View
+        style={[
+          styles.headerOrange,
+          {
+            paddingTop:
+              Math.max(
+                insets.top,
+                Platform.OS === 'android' ? StatusBar.currentHeight || 0 : 0,
+              ) + 6,
+          },
+        ]}>
         <TouchableOpacity
-          style={styles.backButton}
+          style={styles.headerBackBtn}
           onPress={() => navigation.goBack()}
+          hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
           activeOpacity={0.7}>
-          <Text style={styles.backButtonText}>← Quay lại</Text>
+          <Feather name="chevron-left" size={28} color="#FFFFFF" />
         </TouchableOpacity>
-        <View style={styles.headerRight}>
-          <Text style={styles.progressText}>
-            {currentIndex + 1} / {words.length}
+        <View style={styles.headerCenter}>
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {topicTitle}
+          </Text>
+          <Text style={styles.headerSub}>
+            {currentIndex + 1}/{totalWords} từ
           </Text>
         </View>
+        <View style={styles.headerSideSpacer} />
       </View>
 
-      {/* Progress Bar */}
-      <View style={styles.progressBarContainer}>
-        <View style={styles.progressBarBackground}>
-          <Animated.View
-            style={[
-              styles.progressBarFill,
-              {
-                width: progressWidth,
-              },
-            ]}
+      <View style={styles.progressWrap}>
+        <View style={styles.progressTrack}>
+          <View
+            style={[styles.progressFill, {width: `${progressRatio * 100}%`}]}
           />
         </View>
-        <Text style={styles.progressPercentage}>
-          {Math.round(progress)}%
-        </Text>
       </View>
 
-      {/* Flashcard Container */}
-      <View style={styles.flashcardContainer}>
+      <ScrollView
+        style={styles.scrollMain}
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        keyboardShouldPersistTaps="handled">
         <Animated.View
           style={[
-            styles.cardWrapper,
+            styles.cardOuter,
             {
-              transform: [
-                {translateX: position.x},
-                {translateY: position.y},
-              ],
-              opacity: opacity,
+              transform: [{translateX: position.x}, {translateY: position.y}],
+              opacity,
             },
           ]}
           {...panResponder.panHandlers}>
-          {/* Front of Card */}
-          <Animated.View
-            style={[
-              styles.card,
-              styles.cardFront,
-              frontAnimatedStyle,
-              {
-                opacity: flipAnimation.interpolate({
-                  inputRange: [0, 0.5, 1],
-                  outputRange: [1, 0, 0],
-                }),
-              },
-            ]}>
-            <View style={styles.cardContent}>
-              <View style={styles.cardContentInner}>
-
-                {/* Word Section tappable to flip */}
-                <TouchableOpacity
-                  activeOpacity={1}
-                  onPress={handleFlip}
-                  style={styles.wordSectionTouchable}>
-                  {getWordImageSource() ? (
-                    <View style={styles.wordImageWrapper}>
-                      <Image
-                        source={getWordImageSource()}
-                        style={styles.wordImage}
-                        resizeMode="cover"
-                      />
-                    </View>
-                  ) : null}
-                  <View style={styles.wordSection}>
-                    <Text style={styles.wordText}>{currentWord.word}</Text>
-                    <Text style={styles.pronunciationText}>
-                      {currentWord.pronunciation}
-                    </Text>
-                  </View>
-                  <Text style={styles.flipHintText}>
-                    Tap để lật thẻ xem nghĩa
-                  </Text>
-                </TouchableOpacity>
-              </View>
-            </View>
-          </Animated.View>
-
-          {/* Back of Card */}
-          <TouchableOpacity
-            activeOpacity={1}
-            onPress={handleFlip}
-            style={[
-              styles.card,
-              styles.cardBack,
-              backAnimatedStyle,
-              {opacity: flipAnimation.interpolate({
-                inputRange: [0, 0.5, 1],
-                outputRange: [0, 0, 1],
-              })},
-            ]}>
-            <View style={styles.cardContent}>
-              {/* Meaning Section */}
-              <View style={styles.meaningSection}>
-                <Text style={styles.meaningLabel}>Nghĩa tiếng Việt:</Text>
-                <Text style={styles.meaningText}>{currentWord.meaning}</Text>
-              </View>
-
-              {/* Example Section - Always visible */}
-              {currentWord.example && (
-                <View style={styles.exampleSection}>
-                  <Text style={styles.exampleLabel}>Ví dụ minh họa:</Text>
-                  <Text style={styles.exampleText}>
-                    {currentWord.example}
-                  </Text>
-                  <Text style={styles.exampleMeaningText}>
-                    {currentWord.exampleMeaning}
+          {!isFlipped ? (
+            <View style={[styles.cardFront, styles.shadowCard]}>
+              <TouchableOpacity
+                activeOpacity={0.95}
+                onPress={handleFlip}
+                style={[styles.cardFacePressable, styles.cardFacePressableFront]}>
+                <View style={styles.posPill}>
+                  <Text style={styles.posPillText}>
+                    {getPartOfSpeechLabel(currentWord)}
                   </Text>
                 </View>
-              )}
-              
-              {/* Learned Button */}
-              <TouchableOpacity
-                style={[
-                  styles.learnedButton,
-                  isLearned && styles.learnedButtonActive,
-                ]}
-                onPress={(e) => {
-                  e.stopPropagation();
-                  handleToggleLearned();
-                }}
-                activeOpacity={0.7}>
-                <Text style={[
-                  styles.learnedButtonText,
-                  isLearned && styles.learnedButtonTextActive,
-                ]}>
-                  {isLearned ? '✓ Đã học' : '○ Đánh dấu đã học'}
-                </Text>
+                <Text style={styles.wordEnglish}>{currentWord.word}</Text>
+                <Text style={styles.ipaText}>{currentWord.pronunciation}</Text>
+                <TouchableOpacity
+                  style={[
+                    styles.audioCircle,
+                    !canPlayPronunciation && styles.audioCircleDisabled,
+                    isSpeaking && styles.audioCircleActive,
+                  ]}
+                  onPress={(e) => {
+                    e.stopPropagation?.();
+                    if (canPlayPronunciation) handlePlayPronunciation();
+                  }}
+                  disabled={!canPlayPronunciation}
+                  activeOpacity={0.8}>
+                  <Feather
+                    name="volume-2"
+                    size={22}
+                    color={
+                      canPlayPronunciation ? ORANGE_DEEP : COLORS.TEXT_LIGHT
+                    }
+                  />
+                </TouchableOpacity>
+
+                <Text style={styles.hintFront}>Chạm để xem nghĩa</Text>
               </TouchableOpacity>
-              
-              <Text style={styles.flipHintText}>Tap để lật lại</Text>
             </View>
-          </TouchableOpacity>
+          ) : (
+            <View style={[styles.cardBack, styles.shadowCard]}>
+              <TouchableOpacity
+                activeOpacity={0.95}
+                onPress={handleFlip}
+                style={[styles.cardFacePressable, styles.cardFacePressableBack]}>
+                <Text style={styles.meaningLarge}>{currentWord.meaning}</Text>
+                {currentWord.example ? (
+                  <View style={styles.exampleBox}>
+                    <Text style={styles.exampleLabel}>Ví dụ:</Text>
+                    <Text style={styles.exampleEn}>{currentWord.example}</Text>
+                    {!!currentWord.exampleMeaning && (
+                      <Text style={styles.exampleVi}>
+                        {currentWord.exampleMeaning}
+                      </Text>
+                    )}
+                  </View>
+                ) : null}
+                <Text style={styles.hintBack}>Chạm để xem từ</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </Animated.View>
 
-      </View>
-
-      {/* Navigation Buttons */}
-      <View style={styles.navigationContainer}>
-        <TouchableOpacity
-          style={[
-            styles.navButton,
-            currentIndex === 0 && styles.navButtonDisabled,
-          ]}
-          onPress={handlePrevious}
-          disabled={currentIndex === 0}
-          activeOpacity={0.7}>
-          <Text
+        <View style={styles.actionRow}>
+          <TouchableOpacity
             style={[
-              styles.navButtonText,
-              currentIndex === 0 && styles.navButtonTextDisabled,
-            ]}>
-            ← Trước
-          </Text>
-        </TouchableOpacity>
-
-        <TouchableOpacity
-          style={[
-            styles.navButton,
-            styles.navButtonPrimary,
-            currentIndex === words.length - 1 && styles.navButtonDisabled,
-          ]}
-          onPress={handleNext}
-          disabled={currentIndex === words.length - 1}
-          activeOpacity={0.7}>
-          <Text
+              styles.btnUnknown,
+              flashcardUiChoice === 'unknown' && styles.btnUnknownSelected,
+              flashcardUiChoice === 'known' && styles.btnChoiceMuted,
+            ]}
+            onPress={() => handleSetLearned(false)}
+            activeOpacity={0.85}>
+            <Feather name="x" size={22} color="#EF4444" />
+            <Text style={styles.btnUnknownText}>Chưa biết</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
             style={[
-              styles.navButtonText,
-              styles.navButtonTextPrimary,
-              currentIndex === words.length - 1 && styles.navButtonTextDisabled,
-            ]}>
-            Tiếp theo →
-          </Text>
-        </TouchableOpacity>
-      </View>
+              styles.btnKnown,
+              flashcardUiChoice === 'known' && styles.btnKnownSelected,
+              flashcardUiChoice === 'unknown' && styles.btnChoiceMuted,
+            ]}
+            onPress={() => handleSetLearned(true)}
+            activeOpacity={0.85}>
+            <Feather name="check" size={22} color="#FFFFFF" />
+            <Text style={styles.btnKnownText}>Đã biết</Text>
+          </TouchableOpacity>
+        </View>
+
+        <View style={styles.navRow}>
+          <TouchableOpacity
+            style={[
+              styles.navPill,
+              currentIndex === 0 && styles.navPillDisabled,
+            ]}
+            onPress={handlePrevious}
+            disabled={currentIndex === 0}
+            activeOpacity={0.8}>
+            <Feather
+              name="chevron-left"
+              size={20}
+              color={currentIndex === 0 ? COLORS.TEXT_LIGHT : TEXT_NAVY}
+            />
+            <Text
+              style={[
+                styles.navPillText,
+                currentIndex === 0 && styles.navPillTextDisabled,
+              ]}>
+              Trước
+            </Text>
+          </TouchableOpacity>
+
+          <View style={styles.dotsRow}>
+            {words.map((_, i) => (
+              <View
+                key={i}
+                style={[
+                  styles.dot,
+                  i === currentIndex && styles.dotActive,
+                ]}
+              />
+            ))}
+          </View>
+
+          <TouchableOpacity
+            style={styles.navPill}
+            onPress={handleNext}
+            activeOpacity={0.8}>
+            <Text style={styles.navPillText}>
+              {currentIndex < words.length - 1 ? 'Sau' : 'Xong'}
+            </Text>
+            <Feather name="chevron-right" size={20} color={TEXT_NAVY} />
+          </TouchableOpacity>
+        </View>
+        <View style={styles.bottomSpacer} />
+      </ScrollView>
+
+      <InlineAudioPlayer
+        uri={remoteAudio.uri}
+        playKey={remoteAudio.key}
+        onEnd={() => {
+          setRemoteAudio((a) => ({...a, uri: null}));
+          setIsSpeaking(false);
+        }}
+        onError={() => {
+          setRemoteAudio((a) => {
+            if (a.uri) {
+              Linking.openURL(a.uri).catch(() => {});
+            }
+            return {...a, uri: null};
+          });
+          setIsSpeaking(false);
+        }}
+      />
     </SafeAreaView>
   );
 };
@@ -381,258 +571,290 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: COLORS.BACKGROUND,
   },
-  header: {
+  headerOrange: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
     alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingTop: 10,
-    paddingBottom: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.BORDER,
+    paddingHorizontal: 8,
+    paddingVertical: 10,
+    backgroundColor: HEADER_ORANGE,
+    paddingTop: 12,
   },
-  backButton: {
-    paddingVertical: 6,
+  headerBackBtn: {
+    width: 44,
+    height: 44,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  headerCenter: {
+    flex: 1,
+    alignItems: 'center',
     paddingHorizontal: 4,
   },
-  backButtonText: {
-    fontSize: 15,
-    color: COLORS.PRIMARY_DARK,
+  headerTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  headerSub: {
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.9)',
+    marginTop: 2,
     fontWeight: '600',
   },
-  headerRight: {
-    alignItems: 'flex-end',
+  /** Cân layout với nút back bên trái */
+  headerSideSpacer: {
+    width: 44,
+    height: 44,
   },
-  statsContainer: {
-    marginBottom: 4,
+  progressWrap: {
+    backgroundColor: HEADER_ORANGE,
+    paddingHorizontal: 16,
+    paddingBottom: 12,
   },
-  statsText: {
-    fontSize: 12,
-    color: COLORS.SUCCESS,
-    fontWeight: '600',
-  },
-  progressText: {
-    fontSize: 16,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
-  },
-  progressBarContainer: {
-    paddingHorizontal: 20,
-    paddingTop: 8,
-    paddingBottom: 16,
-  },
-  progressBarBackground: {
+  progressTrack: {
     height: 6,
-    backgroundColor: COLORS.BORDER,
-    borderRadius: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(255,255,255,0.35)',
     overflow: 'hidden',
-    marginBottom: 6,
   },
-  progressBarFill: {
-    height: 4,
-    backgroundColor: COLORS.PRIMARY_DARK,
-    borderRadius: 6,
-  },
-  progressPercentage: {
-    fontSize: 11,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: 'right',
-    fontWeight: '600',
-  },
-  flashcardContainer: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 20,
-    paddingBottom: 16,
-  },
-  cardWrapper: {
-    width: SCREEN_WIDTH - 40,
-    height: 380,
-  },
-  card: {
-    position: 'absolute',
-    width: '100%',
+  progressFill: {
     height: '100%',
-    backfaceVisibility: 'hidden',
+    borderRadius: 999,
+    backgroundColor: '#292524',
+  },
+  scrollMain: {
+    flex: 1,
+  },
+  scrollContent: {
+    paddingHorizontal: 16,
+    paddingTop: 16,
+    paddingBottom: 28,
+  },
+  cardOuter: {
+    minHeight: 340,
+    marginBottom: 16,
+  },
+  shadowCard: {
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 4},
+    shadowOpacity: 0.12,
+    shadowRadius: 10,
+    elevation: 6,
   },
   cardFront: {
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 24,
-    shadowColor: COLORS.TEXT,
-    shadowOffset: {width: 0, height: 4},
-    shadowOpacity: 0.2,
-    shadowRadius: 12,
-    elevation: 8,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    minHeight: 300,
+    overflow: 'visible',
   },
   cardBack: {
-    backgroundColor: COLORS.PRIMARY_SOFT,
-    borderRadius: 24,
-    shadowColor: COLORS.TEXT,
-    shadowOffset: {width: 0, height: 4},
-    shadowOpacity: 0.2,
-    shadowRadius: 12,
-    elevation: 8,
+    backgroundColor: HEADER_ORANGE,
+    borderRadius: 20,
+    minHeight: 300,
+    overflow: 'visible',
   },
-  cardContent: {
+  cardFacePressable: {
     flex: 1,
     width: '100%',
+    alignItems: 'center',
+    justifyContent: 'center',
+    minHeight: 300,
   },
-  cardContentInner: {
-    flex: 1,
+  cardFacePressableFront: {
+    paddingVertical: 28,
+    paddingHorizontal: 20,
+  },
+  cardFacePressableBack: {
+    paddingVertical: 24,
+    paddingHorizontal: 18,
+  },
+  posPill: {
+    position: 'absolute',
+    top: 16,
+    alignSelf: 'center',
+    backgroundColor: '#F3F4F6',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 999,
+  },
+  posPillText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#64748B',
+  },
+  wordEnglish: {
+    fontSize: 36,
+    fontWeight: '800',
+    color: TEXT_NAVY,
+    textAlign: 'center',
+    marginTop: 40,
+    marginBottom: 8,
+  },
+  ipaText: {
+    fontSize: 17,
+    color: '#64748B',
+    textAlign: 'center',
+    marginBottom: 20,
+  },
+  audioCircle: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    backgroundColor: '#FFF0E0',
     justifyContent: 'center',
     alignItems: 'center',
-    padding: 26,
-  },
-  wordImageWrapper: {
-    width: 170,
-    height: 110,
-    borderRadius: 14,
-    overflow: 'hidden',
-    marginBottom: 18,
-    backgroundColor: COLORS.BORDER,
-  },
-  wordImage: {
-    width: '100%',
-    height: '100%',
-  },
-  wordSection: {
     marginBottom: 20,
-    width: '100%',
-    alignItems: 'center',
   },
-  wordSectionTouchable: {
-    width: '100%',
-    alignItems: 'center',
+  audioCircleDisabled: {
+    opacity: 0.45,
   },
-  wordText: {
-    fontSize: 40,
-    fontWeight: 'bold',
-    color: COLORS.PRIMARY_DARK,
-    marginBottom: 12,
-    textAlign: 'center',
+  audioCircleActive: {
+    opacity: 0.75,
   },
-  pronunciationText: {
-    fontSize: 20,
-    color: COLORS.TEXT_SECONDARY,
-    fontStyle: 'italic',
-    textAlign: 'center',
+  hintFront: {
+    fontSize: 13,
+    color: '#94A3B8',
+    fontWeight: '500',
   },
-  flipHintText: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
-    fontStyle: 'italic',
-    marginTop: 20,
-  },
-  meaningSection: {
-    marginBottom: 24,
-    width: '100%',
-  },
-  meaningLabel: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
-    marginBottom: 12,
-    textAlign: 'center',
-  },
-  meaningText: {
+  meaningLarge: {
     fontSize: 32,
-    fontWeight: 'bold',
-    color: COLORS.PRIMARY_DARK,
+    fontWeight: '800',
+    color: '#FFFFFF',
     textAlign: 'center',
-    lineHeight: 40,
-  },
-  exampleSection: {
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 16,
-    padding: 20,
-    width: '100%',
     marginBottom: 20,
   },
-  exampleToggle: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 20,
+  exampleBox: {
+    width: '100%',
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    borderRadius: 14,
+    padding: 14,
     marginBottom: 16,
-  },
-  exampleToggleText: {
-    fontSize: 16,
-    color: COLORS.PRIMARY_DARK,
-    fontWeight: '600',
-  },
-  learnedButton: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 20,
-    marginBottom: 16,
-    borderWidth: 2,
-    borderColor: COLORS.BORDER,
-  },
-  learnedButtonActive: {
-    backgroundColor: COLORS.SUCCESS,
-    borderColor: COLORS.SUCCESS,
-  },
-  learnedButtonText: {
-    fontSize: 16,
-    color: COLORS.TEXT,
-    fontWeight: '600',
-  },
-  learnedButtonTextActive: {
-    color: COLORS.BACKGROUND_WHITE,
   },
   exampleLabel: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
-    marginBottom: 12,
-  },
-  exampleText: {
-    fontSize: 18,
-    color: COLORS.TEXT,
-    fontStyle: 'italic',
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.95)',
+    fontWeight: '700',
     marginBottom: 8,
-    textAlign: 'center',
   },
-  exampleMeaningText: {
+  exampleEn: {
     fontSize: 16,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: 'center',
+    fontWeight: '800',
+    color: '#FFFFFF',
+    marginBottom: 6,
   },
-  navigationContainer: {
+  exampleVi: {
+    fontSize: 14,
+    color: 'rgba(255,255,255,0.95)',
+    lineHeight: 20,
+  },
+  hintBack: {
+    fontSize: 13,
+    color: 'rgba(255,255,255,0.85)',
+    fontWeight: '500',
+  },
+  actionRow: {
     flexDirection: 'row',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 16,
-    gap: 10,
+    gap: 12,
+    marginBottom: 16,
   },
-  navButton: {
+  btnUnknown: {
     flex: 1,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    paddingVertical: 14,
-    borderRadius: 14,
+    flexDirection: 'row',
     alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#FFFFFF',
     borderWidth: 2,
+    borderColor: '#EF4444',
+    borderRadius: 14,
+    paddingVertical: 14,
+  },
+  btnUnknownText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#EF4444',
+  },
+  btnKnown: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: '#22C55E',
+    borderRadius: 14,
+    paddingVertical: 14,
+  },
+  /** Đã lưu: Chưa biết — nền nhạt để thấy rõ đang chọn */
+  btnUnknownSelected: {
+    backgroundColor: '#FEF2F2',
+    borderWidth: 2,
+    borderColor: '#DC2626',
+  },
+  /** Đã lưu: Đã biết — viền đậm */
+  btnKnownSelected: {
+    borderWidth: 3,
+    borderColor: '#15803D',
+  },
+  /** Nút kia đang được chọn — làm mờ nhẹ */
+  btnChoiceMuted: {
+    opacity: 0.42,
+  },
+  btnKnownText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  navRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+    gap: 8,
+  },
+  navPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 4,
+    backgroundColor: '#FFFFFF',
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    borderWidth: 1,
     borderColor: COLORS.BORDER,
   },
-  navButtonPrimary: {
-    backgroundColor: COLORS.PRIMARY_DARK,
-    borderColor: COLORS.PRIMARY_DARK,
+  navPillDisabled: {
+    opacity: 0.45,
   },
-  navButtonDisabled: {
-    opacity: 0.5,
+  navPillText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: TEXT_NAVY,
   },
-  navButtonText: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: COLORS.TEXT,
+  navPillTextDisabled: {
+    color: COLORS.TEXT_LIGHT,
   },
-  navButtonTextPrimary: {
-    color: COLORS.BACKGROUND_WHITE,
+  dotsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    flex: 1,
+    justifyContent: 'center',
+    flexWrap: 'wrap',
+    maxWidth: SCREEN_WIDTH * 0.36,
   },
-  navButtonTextDisabled: {
-    color: COLORS.TEXT_SECONDARY,
+  dot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: '#D1D5DB',
+  },
+  dotActive: {
+    width: 22,
+    height: 7,
+    backgroundColor: HEADER_ORANGE,
+  },
+  bottomSpacer: {
+    height: 8,
   },
   emptyContainer: {
     flex: 1,

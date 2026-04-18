@@ -15,7 +15,7 @@ function App() {
   const isDarkMode = useColorScheme() === 'dark';
 
   useEffect(() => {
-    initStorageSync();
+    void initStorageSync().catch(() => {});
   }, []);
 
   return (

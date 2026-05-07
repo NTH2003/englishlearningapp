@@ -1,4 +1,4 @@
-import React, {useState, useEffect, useMemo, useRef} from 'react';
+import React, {useState, useEffect, useMemo, useRef, useCallback} from 'react';
 import {
   View,
   Text,
@@ -7,14 +7,16 @@ import {
   Animated,
   PanResponder,
   Dimensions,
-  SafeAreaView,
   Linking,
   ScrollView,
   Platform,
   StatusBar,
+  Image,
+  Modal,
 } from 'react-native';
 import Feather from 'react-native-vector-icons/Feather';
-import {useSafeAreaInsets} from 'react-native-safe-area-context';
+import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
+import {CommonActions, useFocusEffect} from '@react-navigation/native';
 import {COLORS} from '../../constants';
 import {
   markWordAsLearned,
@@ -26,7 +28,10 @@ import {
   buildExplicitChuaBietSetFromReviewWrong,
 } from '../../services/vocabularyService';
 import {getWordMedia} from '../../services/firebaseService';
+import {searchPexelsPhoto} from '../../services/pexelsService';
+import {saveContinueLearning, CONTINUE_KIND} from '../../services/continueLearning';
 import InlineAudioPlayer from '../../components/InlineAudioPlayer';
+import {emitLearningProgressUpdated} from '../../services/learningProgressEvents';
 
 let Tts = null;
 try {
@@ -36,16 +41,94 @@ try {
 }
 
 const {width: SCREEN_WIDTH} = Dimensions.get('window');
+/** Hai mặt thẻ dùng cùng khung (mặt trước có ảnh minh họa cao 160px + pill + chữ — nếu chỉ minHeight thấp thì mặt sau trông nhỏ hơn). */
+const FLASHCARD_FACE_MIN_HEIGHT = 500;
 const SWIPE_THRESHOLD = 120;
+const SWIPE_VELOCITY_THRESHOLD = 0.3;
 
 const TEXT_NAVY = '#0F172A';
 const ORANGE_DEEP = '#EA580C';
 const HEADER_ORANGE = COLORS.PRIMARY;
+const POST_FLASHCARD_AUTO_MS = 5000;
+const POST_FLASHCARD_AUTO_SECONDS = Math.ceil(POST_FLASHCARD_AUTO_MS / 1000);
 
 function getPartOfSpeechLabel(word) {
   if (!word) return 'Từ vựng';
-  if (word.partOfSpeechVi) return word.partOfSpeechVi;
+  const vi = String(word.partOfSpeechVi || '').trim();
+  if (vi) return vi;
+  const raw = String(word.partOfSpeech || '').trim();
+  if (raw) return raw;
   return 'Từ vựng';
+}
+
+function isHttpUrl(s) {
+  return /^https?:\/\//i.test(String(s || '').trim());
+}
+
+/** Ảnh tùy chỉnh (Firestore / admin) — nếu có thì không gọi Pexels. */
+function pickStaticImageUrl(word, media) {
+  const candidates = [
+    word?.imageUrl,
+    word?.thumbnailUrl,
+    word?.photoUrl,
+    word?.image,
+    media?.imageUrl,
+    media?.thumbnailUrl,
+    media?.photoUrl,
+  ];
+  for (const c of candidates) {
+    const u = String(c || '').trim();
+    if (u && isHttpUrl(u)) {
+      return u;
+    }
+  }
+  return '';
+}
+
+function buildPexelsQuery(word) {
+  return String(word?.word || '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .slice(0, 100);
+}
+
+async function resolveFlashcardImageUrl(word, media) {
+  const preset = pickStaticImageUrl(word, media);
+  if (preset) {
+    return preset;
+  }
+  const q = buildPexelsQuery(word);
+  if (!q) {
+    return '';
+  }
+  try {
+    return (await searchPexelsPhoto(q)) || '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function buildInstantFallbackImageUrl(word) {
+  const seed = encodeURIComponent(
+    String(word?.word || word?.text || word?.id || 'vocab').trim().toLowerCase(),
+  );
+  return `https://picsum.photos/seed/${seed}/900/560`;
+}
+
+async function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms)),
+  ]);
+}
+
+function runAfterUiSettled(task) {
+  const ric = globalThis?.requestIdleCallback;
+  if (typeof ric === 'function') {
+    ric(() => task());
+    return;
+  }
+  setTimeout(task, 0);
 }
 
 const VocabularyFlashcardScreen = ({route, navigation}) => {
@@ -62,13 +145,42 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
   const [isSpeaking, setIsSpeaking] = useState(false);
   /** Phát file âm thanh trong app (khi không dùng TTS) */
   const [remoteAudio, setRemoteAudio] = useState({uri: null, key: 0});
+  /** Ảnh minh họa mặt trước thẻ: ưu tiên URL tĩnh, sau đó Pexels theo từ tiếng Anh */
+  const [cardImageUrl, setCardImageUrl] = useState('');
+  const [postFlashcardSheetVisible, setPostFlashcardSheetVisible] =
+    useState(false);
+  const [postFlashcardCountdown, setPostFlashcardCountdown] = useState(
+    POST_FLASHCARD_AUTO_SECONDS,
+  );
 
   const position = useRef(new Animated.ValueXY()).current;
   const opacity = useRef(new Animated.Value(1)).current;
+  const swipeAnimatingRef = useRef(false);
   /** Chỉ khi user chủ động bấm "Chưa biết" — kết phiên không coi là đã học. Còn lại (lật thẻ/xem hết) vẫn lưu đã học. */
   const explicitChuaBietRef = useRef(new Set());
   /** Từ đã bấm Đã biết / Chưa biết trong phiên — tránh seed async ghi đè lựa chọn vừa chọn. */
   const userPressedFlashcardRef = useRef(new Set());
+  /** Tăng mỗi lần đổi thẻ — async getWordMedia/Pexels không ghi đè thẻ mới. */
+  const cardSyncIdRef = useRef(0);
+  const postFlashcardShownRef = useRef(false);
+  const postFlashcardChoiceMadeRef = useRef(false);
+  const postFlashcardAutoTimerRef = useRef(null);
+  const postFlashcardCountdownTimerRef = useRef(null);
+
+  const clearPostFlashcardTimers = useCallback(() => {
+    if (postFlashcardAutoTimerRef.current != null) {
+      clearTimeout(postFlashcardAutoTimerRef.current);
+      postFlashcardAutoTimerRef.current = null;
+    }
+    if (postFlashcardCountdownTimerRef.current != null) {
+      clearInterval(postFlashcardCountdownTimerRef.current);
+      postFlashcardCountdownTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => clearPostFlashcardTimers();
+  }, [clearPostFlashcardTimers]);
 
   /** Khôi phục “Chưa biết” đã lưu cho cả phiên (kết phiên cần đúng bộ). */
   useEffect(() => {
@@ -103,6 +215,17 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
     };
   }, [words, isReviewSession]);
 
+  useFocusEffect(
+    useCallback(() => {
+      if (!topicId || topicId === 'review') return;
+      void saveContinueLearning({
+        kind: CONTINUE_KIND.VOCAB_FLASHCARD,
+        topicId: String(topicId),
+        topicName: String(topicTitle || '').slice(0, 120),
+      });
+    }, [topicId, topicTitle]),
+  );
+
   const currentWord = words && words[currentIndex] ? words[currentIndex] : null;
   const totalWords = Array.isArray(words) ? words.length : 0;
 
@@ -114,6 +237,11 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
     if (v === false) return 'unknown';
     return null;
   }, [currentWord?.id, wordStatus]);
+
+  const hasKnownWordsForPractice = useMemo(() => {
+    if (!Array.isArray(words) || !words.length) return false;
+    return words.some((w) => wordStatus[String(w?.id)] === true);
+  }, [words, wordStatus]);
 
   const progressRatio =
     totalWords > 0 ? (currentIndex + 1) / totalWords : 0;
@@ -157,26 +285,40 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
 
     let cancelled = false;
     const wordId = currentWord?.id;
+    const syncId = ++cardSyncIdRef.current;
+
+    const isStale = () => cancelled || syncId !== cardSyncIdRef.current;
 
     const syncStatuses = async () => {
       if (!currentWord || wordId == null) {
-        if (!cancelled) {
+        if (!isStale()) {
           setWordMedia(null);
+          setCardImageUrl('');
         }
         return;
+      }
+      if (!isStale()) {
+        const staticImage = pickStaticImageUrl(currentWord, null);
+        // Hiển thị ảnh ngay khi vào thẻ: ưu tiên ảnh tĩnh có sẵn, nếu không có dùng fallback theo seed.
+        setCardImageUrl(staticImage || buildInstantFallbackImageUrl(currentWord));
       }
       try {
         const sid = String(currentWord.id);
         if (isReviewSession) {
-          if (cancelled) return;
-          const media = await getWordMedia(currentWord.id);
-          if (cancelled) return;
+          const media = await withTimeout(getWordMedia(currentWord.id), 3500).catch(() => null);
+          if (isStale()) return;
           setWordMedia(media);
+          const img = await withTimeout(
+            resolveFlashcardImageUrl(currentWord, media),
+            4500,
+          ).catch(() => '');
+          if (isStale()) return;
+          if (img) setCardImageUrl(img);
           return;
         }
         const report = await getFlashcardSelfReport(currentWord.id);
         const learnedGlobal = await isWordLearned(currentWord.id);
-        if (cancelled) return;
+        if (isStale()) return;
 
         let choice = null;
         if (report === true) choice = 'known';
@@ -189,10 +331,18 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
             choice === 'known' ? true : choice === 'unknown' ? false : undefined,
         }));
 
-        const media = await getWordMedia(currentWord.id);
-        if (cancelled) return;
+        const media = await withTimeout(getWordMedia(currentWord.id), 3500).catch(() => null);
+        if (isStale()) return;
         setWordMedia(media);
-      } catch (_) {}
+        const img = await withTimeout(
+          resolveFlashcardImageUrl(currentWord, media),
+          4500,
+        ).catch(() => '');
+        if (isStale()) return;
+        if (img) setCardImageUrl(img);
+      } catch (_) {
+        // giữ placeholder tĩnh khi lỗi tải ảnh
+      }
     };
     syncStatuses();
     return () => {
@@ -208,47 +358,123 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
     setRemoteAudio({uri: null, key: 0});
   }, [currentIndex, currentWord?.id]);
 
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: () => true,
-      onMoveShouldSetPanResponder: () => true,
-      onPanResponderMove: (evt, gestureState) => {
-        position.setValue({x: gestureState.dx, y: gestureState.dy});
-        opacity.setValue(1 - Math.abs(gestureState.dx) / SCREEN_WIDTH);
-      },
-      onPanResponderRelease: (evt, gestureState) => {
-        if (Math.abs(gestureState.dx) > SWIPE_THRESHOLD) {
-          if (gestureState.dx > 0) {
-            handlePrevious();
-          } else {
-            handleNext();
-          }
-        } else {
-          Animated.spring(position, {
-            toValue: {x: 0, y: 0},
-            useNativeDriver: false,
-          }).start();
-          Animated.spring(opacity, {
-            toValue: 1,
-            useNativeDriver: false,
-          }).start();
-        }
-      },
-    }),
-  ).current;
+  const animateCardBackToCenter = () => {
+    Animated.parallel([
+      Animated.spring(position, {
+        toValue: {x: 0, y: 0},
+        useNativeDriver: false,
+      }),
+      Animated.timing(opacity, {
+        toValue: 1,
+        duration: 160,
+        useNativeDriver: false,
+      }),
+    ]).start();
+  };
 
   /** Một lần ghi wordsLearned + XP — tránh 5 lần lưu tuần tự bị cắt khi thoát app. */
-  const finalizeSessionProgress = () => {
+  const finalizeSessionProgress = useCallback(() => {
     if (!Array.isArray(words) || !words.length) return Promise.resolve();
     if (isReviewSession) {
       return commitReviewFlashcardSession(words, [
         ...explicitChuaBietRef.current,
-      ]);
+      ]).finally(() => {
+        emitLearningProgressUpdated({resetTopicFilters: true});
+      });
     }
     return commitFlashcardSessionWords(words, [
       ...explicitChuaBietRef.current,
-    ]);
-  };
+    ]).finally(() => {
+      emitLearningProgressUpdated({resetTopicFilters: true});
+    });
+  }, [words, isReviewSession]);
+
+  const onPostFlashcardGoHome = useCallback(() => {
+    if (postFlashcardChoiceMadeRef.current) return;
+    postFlashcardChoiceMadeRef.current = true;
+    clearPostFlashcardTimers();
+    setPostFlashcardSheetVisible(false);
+    navigation.dispatch(
+      CommonActions.reset({
+        index: 0,
+        routes: [{name: 'Vocabulary'}],
+      }),
+    );
+    const tabNav = navigation.getParent?.();
+    tabNav?.navigate('HomeTab', {screen: 'Home'});
+    runAfterUiSettled(() => {
+      emitLearningProgressUpdated({resetTopicFilters: true});
+    });
+  }, [clearPostFlashcardTimers, navigation]);
+
+  const onPostFlashcardReplay = useCallback(() => {
+    if (postFlashcardChoiceMadeRef.current) return;
+    postFlashcardChoiceMadeRef.current = true;
+    clearPostFlashcardTimers();
+    setPostFlashcardSheetVisible(false);
+    setCurrentIndex(0);
+    setIsFlipped(false);
+    setWordStatus({});
+    explicitChuaBietRef.current = new Set();
+    userPressedFlashcardRef.current = new Set();
+    postFlashcardShownRef.current = false;
+    setPostFlashcardCountdown(POST_FLASHCARD_AUTO_SECONDS);
+  }, [clearPostFlashcardTimers]);
+
+  const onPostFlashcardPractice = useCallback(() => {
+    if (postFlashcardChoiceMadeRef.current) return;
+    postFlashcardChoiceMadeRef.current = true;
+    clearPostFlashcardTimers();
+    setPostFlashcardSheetVisible(false);
+    const list = Array.isArray(words) ? words : [];
+    const knownOnly = list.filter(
+      (w) => wordStatus[String(w?.id)] === true,
+    );
+    if (knownOnly.length === 0) {
+      onPostFlashcardReplay();
+      return;
+    }
+    navigation.replace('VocabularyQuiz', {
+      words: [...knownOnly]
+        .sort(() => Math.random() - 0.5)
+        .slice(0, Math.min(12, knownOnly.length)),
+      topicId,
+      topicName: topicTitle,
+      topic,
+      mixedPractice: true,
+      hideQuizTimer: true,
+    });
+  }, [
+    clearPostFlashcardTimers,
+    navigation,
+    words,
+    wordStatus,
+    topicId,
+    topicTitle,
+    topic,
+    onPostFlashcardReplay,
+  ]);
+
+  const runPostFlashcardAuto = useCallback(() => {
+    onPostFlashcardPractice();
+  }, [onPostFlashcardPractice]);
+
+  const openPostFlashcardSheet = useCallback(() => {
+    postFlashcardChoiceMadeRef.current = false;
+    setPostFlashcardCountdown(POST_FLASHCARD_AUTO_SECONDS);
+    setPostFlashcardSheetVisible(true);
+    finalizeSessionProgress().catch((e) =>
+      console.warn('finalizeSessionProgress', e?.message),
+    );
+    if (hasKnownWordsForPractice) {
+      postFlashcardCountdownTimerRef.current = setInterval(() => {
+        setPostFlashcardCountdown((prev) => (prev > 0 ? prev - 1 : 0));
+      }, 1000);
+      postFlashcardAutoTimerRef.current = setTimeout(() => {
+        runPostFlashcardAuto();
+      }, POST_FLASHCARD_AUTO_MS);
+    }
+  }, [finalizeSessionProgress, hasKnownWordsForPractice, runPostFlashcardAuto]);
 
   const handleNext = () => {
     if (!Array.isArray(words) || !words.length) return;
@@ -256,28 +482,9 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
       setCurrentIndex(currentIndex + 1);
       return;
     }
-    const finalWordStatus = {};
-    let rem = 0;
-    for (const w of words) {
-      const sid = String(w.id);
-      const known = !explicitChuaBietRef.current.has(sid);
-      finalWordStatus[sid] = known;
-      if (known) rem += 1;
-    }
-    const total = words.length;
-    /** Sang tổng kết ngay — không await lưu (Firebase/getLearningProgress có thể treo → màn hình không mở). */
-    navigation.replace('FlashcardResult', {
-      topicId,
-      topicName,
-      topic,
-      words,
-      wordStatus: finalWordStatus,
-      rememberedCount: rem,
-      notRememberedCount: Math.max(0, total - rem),
-    });
-    finalizeSessionProgress().catch((e) =>
-      console.warn('finalizeSessionProgress', e?.message),
-    );
+    if (postFlashcardShownRef.current) return;
+    postFlashcardShownRef.current = true;
+    openPostFlashcardSheet();
   };
 
   const handlePrevious = () => {
@@ -285,6 +492,77 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
       setCurrentIndex(currentIndex - 1);
     }
   };
+
+  const swipeToDirection = direction => {
+    if (swipeAnimatingRef.current) return;
+    if (!Array.isArray(words) || totalWords <= 0) {
+      animateCardBackToCenter();
+      return;
+    }
+    const canMove =
+      direction === 'next'
+        ? currentIndex < totalWords - 1
+        : currentIndex > 0;
+    if (!canMove) {
+      animateCardBackToCenter();
+      return;
+    }
+    swipeAnimatingRef.current = true;
+    const toX = direction === 'next' ? -SCREEN_WIDTH * 1.1 : SCREEN_WIDTH * 1.1;
+    Animated.parallel([
+      Animated.timing(position, {
+        toValue: {x: toX, y: 0},
+        duration: 170,
+        useNativeDriver: false,
+      }),
+      Animated.timing(opacity, {
+        toValue: 0.22,
+        duration: 140,
+        useNativeDriver: false,
+      }),
+    ]).start(({finished}) => {
+      if (finished) {
+        if (direction === 'next') handleNext();
+        else handlePrevious();
+      }
+      swipeAnimatingRef.current = false;
+    });
+  };
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => false,
+      onMoveShouldSetPanResponder: (_evt, gestureState) => {
+        const dx = Math.abs(gestureState.dx);
+        const dy = Math.abs(gestureState.dy);
+        if (swipeAnimatingRef.current) return false;
+        // Chỉ bắt gesture vuốt ngang rõ ràng, tránh cướp cuộn dọc.
+        return dx > 8 && dx > dy * 1.2;
+      },
+      onPanResponderMove: (_evt, gestureState) => {
+        if (swipeAnimatingRef.current) return;
+        position.setValue({x: gestureState.dx, y: 0});
+        const alpha = Math.max(0.28, 1 - Math.abs(gestureState.dx) / SCREEN_WIDTH);
+        opacity.setValue(alpha);
+      },
+      onPanResponderRelease: (_evt, gestureState) => {
+        if (swipeAnimatingRef.current) return;
+        const distancePass = Math.abs(gestureState.dx) > SWIPE_THRESHOLD;
+        const velocityPass =
+          Math.abs(gestureState.dx) > 36 &&
+          Math.abs(gestureState.vx) > SWIPE_VELOCITY_THRESHOLD;
+        if (distancePass || velocityPass) {
+          swipeToDirection(gestureState.dx > 0 ? 'previous' : 'next');
+          return;
+        }
+        animateCardBackToCenter();
+      },
+      onPanResponderTerminate: () => {
+        if (swipeAnimatingRef.current) return;
+        animateCardBackToCenter();
+      },
+    }),
+  ).current;
 
   const handleFlip = () => {
     setIsFlipped(!isFlipped);
@@ -305,9 +583,12 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
       [sid]: newLearnedStatus,
     }));
     if (isReviewSession) {
+      emitLearningProgressUpdated({resetTopicFilters: false});
       return;
     }
-    await markWordAsLearned(currentWord.id, newLearnedStatus);
+    // Không ghi Firestore theo từng lần bấm (rất chậm khi học nhanh nhiều từ).
+    // Tiến độ phiên sẽ được ghi một lần ở finalizeSessionProgress().
+    emitLearningProgressUpdated({resetTopicFilters: false});
   };
 
   const hasRemoteAudio = Boolean(
@@ -350,7 +631,7 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
 
   if (!currentWord) {
     return (
-      <SafeAreaView style={styles.container}>
+      <SafeAreaView style={styles.container} edges={['left', 'right', 'bottom']}>
         <View style={styles.emptyContainer}>
           <Text style={styles.emptyText}>Không có từ vựng nào</Text>
         </View>
@@ -359,7 +640,7 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
   }
 
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['left', 'right', 'bottom']}>
       <View
         style={[
           styles.headerOrange,
@@ -422,7 +703,30 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
                     {getPartOfSpeechLabel(currentWord)}
                   </Text>
                 </View>
-                <Text style={styles.wordEnglish}>{currentWord.word}</Text>
+                {!!cardImageUrl && (
+                  <View style={styles.cardImageSlot}>
+                    <Image
+                      source={{uri: cardImageUrl}}
+                      style={styles.cardImage}
+                      resizeMode="cover"
+                      accessibilityRole="image"
+                      accessibilityLabel={`Minh họa: ${currentWord.word || 'từ vựng'}`}
+                    />
+                  </View>
+                )}
+                {!cardImageUrl && (
+                  <View style={styles.cardImageFallback}>
+                    <Feather name="image" size={24} color={COLORS.TEXT_LIGHT} />
+                    <Text style={styles.cardImageFallbackText}>Chưa có ảnh minh họa</Text>
+                  </View>
+                )}
+                <Text
+                  style={[
+                    styles.wordEnglish,
+                    !!cardImageUrl && styles.wordEnglishWithImage,
+                  ]}>
+                  {currentWord.word}
+                </Text>
                 <Text style={styles.ipaText}>{currentWord.pronunciation}</Text>
                 <TouchableOpacity
                   style={[
@@ -455,17 +759,23 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
                 onPress={handleFlip}
                 style={[styles.cardFacePressable, styles.cardFacePressableBack]}>
                 <Text style={styles.meaningLarge}>{currentWord.meaning}</Text>
-                {currentWord.example ? (
-                  <View style={styles.exampleBox}>
-                    <Text style={styles.exampleLabel}>Ví dụ:</Text>
-                    <Text style={styles.exampleEn}>{currentWord.example}</Text>
-                    {!!currentWord.exampleMeaning && (
-                      <Text style={styles.exampleVi}>
-                        {currentWord.exampleMeaning}
-                      </Text>
-                    )}
-                  </View>
-                ) : null}
+                <View style={styles.exampleBox}>
+                  <Text style={styles.exampleLabel}>Ví dụ:</Text>
+                  {currentWord.example ? (
+                    <>
+                      <Text style={styles.exampleEn}>{currentWord.example}</Text>
+                      {!!currentWord.exampleMeaning && (
+                        <Text style={styles.exampleVi}>
+                          {currentWord.exampleMeaning}
+                        </Text>
+                      )}
+                    </>
+                  ) : (
+                    <Text style={styles.exampleMissing}>
+                      Chưa có ví dụ cho từ này.
+                    </Text>
+                  )}
+                </View>
                 <Text style={styles.hintBack}>Chạm để xem từ</Text>
               </TouchableOpacity>
             </View>
@@ -475,25 +785,37 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
         <View style={styles.actionRow}>
           <TouchableOpacity
             style={[
+              styles.choiceBtnBase,
               styles.btnUnknown,
               flashcardUiChoice === 'unknown' && styles.btnUnknownSelected,
               flashcardUiChoice === 'known' && styles.btnChoiceMuted,
             ]}
             onPress={() => handleSetLearned(false)}
             activeOpacity={0.85}>
-            <Feather name="x" size={22} color="#EF4444" />
-            <Text style={styles.btnUnknownText}>Chưa biết</Text>
+            <View style={styles.choiceIconWrapUnknown}>
+              <Feather name="x" size={20} color="#EF4444" />
+            </View>
+            <View style={styles.choiceTextCol}>
+              <Text style={styles.btnUnknownText}>Chưa biết</Text>
+              <Text style={styles.choiceSubTextUnknown}>Ôn lại từ này</Text>
+            </View>
           </TouchableOpacity>
           <TouchableOpacity
             style={[
+              styles.choiceBtnBase,
               styles.btnKnown,
               flashcardUiChoice === 'known' && styles.btnKnownSelected,
               flashcardUiChoice === 'unknown' && styles.btnChoiceMuted,
             ]}
             onPress={() => handleSetLearned(true)}
             activeOpacity={0.85}>
-            <Feather name="check" size={22} color="#FFFFFF" />
-            <Text style={styles.btnKnownText}>Đã biết</Text>
+            <View style={styles.choiceIconWrapKnown}>
+              <Feather name="check" size={20} color="#FFFFFF" />
+            </View>
+            <View style={styles.choiceTextCol}>
+              <Text style={styles.btnKnownText}>Đã biết</Text>
+              <Text style={styles.choiceSubTextKnown}>Đánh dấu đã nhớ</Text>
+            </View>
           </TouchableOpacity>
         </View>
 
@@ -562,6 +884,42 @@ const VocabularyFlashcardScreen = ({route, navigation}) => {
           setIsSpeaking(false);
         }}
       />
+
+      <Modal
+        visible={postFlashcardSheetVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={onPostFlashcardGoHome}>
+        <View style={styles.sheetOverlay} pointerEvents="box-none">
+          <View style={[styles.sheetWrap, {paddingBottom: Math.max(insets.bottom, 16)}]}>
+            <View style={styles.sheetHandle} />
+            <Text style={styles.sheetTitle}>Hoàn thành flashcard</Text>
+            <Text style={styles.sheetSubtitle}>Tiếp tục củng cố để nhớ từ lâu hơn.</Text>
+            <TouchableOpacity
+              style={styles.sheetPrimaryBtn}
+              onPress={
+                hasKnownWordsForPractice
+                  ? onPostFlashcardPractice
+                  : onPostFlashcardReplay
+              }
+              activeOpacity={0.88}>
+              <Feather name="play-circle" size={18} color="#FFFFFF" />
+              <Text style={styles.sheetPrimaryBtnText}>
+                {hasKnownWordsForPractice
+                  ? `Tiếp tục (${postFlashcardCountdown}s)`
+                  : 'Học lại bộ từ'}
+              </Text>
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={styles.sheetSecondaryBtn}
+              onPress={onPostFlashcardGoHome}
+              activeOpacity={0.88}>
+              <Feather name="home" size={18} color={COLORS.PRIMARY_DARK} />
+              <Text style={styles.sheetSecondaryBtnText}>Về trang chủ</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 };
@@ -631,7 +989,8 @@ const styles = StyleSheet.create({
     paddingBottom: 28,
   },
   cardOuter: {
-    minHeight: 340,
+    minHeight: FLASHCARD_FACE_MIN_HEIGHT,
+    width: '100%',
     marginBottom: 16,
   },
   shadowCard: {
@@ -644,13 +1003,15 @@ const styles = StyleSheet.create({
   cardFront: {
     backgroundColor: '#FFFFFF',
     borderRadius: 20,
-    minHeight: 300,
+    minHeight: FLASHCARD_FACE_MIN_HEIGHT,
+    width: '100%',
     overflow: 'visible',
   },
   cardBack: {
     backgroundColor: HEADER_ORANGE,
     borderRadius: 20,
-    minHeight: 300,
+    minHeight: FLASHCARD_FACE_MIN_HEIGHT,
+    width: '100%',
     overflow: 'visible',
   },
   cardFacePressable: {
@@ -658,15 +1019,15 @@ const styles = StyleSheet.create({
     width: '100%',
     alignItems: 'center',
     justifyContent: 'center',
-    minHeight: 300,
+    minHeight: FLASHCARD_FACE_MIN_HEIGHT,
   },
   cardFacePressableFront: {
     paddingVertical: 28,
     paddingHorizontal: 20,
   },
   cardFacePressableBack: {
-    paddingVertical: 24,
-    paddingHorizontal: 18,
+    paddingVertical: 28,
+    paddingHorizontal: 20,
   },
   posPill: {
     position: 'absolute',
@@ -689,6 +1050,40 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     marginTop: 40,
     marginBottom: 8,
+  },
+  wordEnglishWithImage: {
+    marginTop: 12,
+  },
+  cardImageSlot: {
+    width: '100%',
+    height: 160,
+    borderRadius: 16,
+    overflow: 'hidden',
+    backgroundColor: '#F1F5F9',
+    marginTop: 44,
+    marginBottom: 4,
+  },
+  cardImage: {
+    width: '100%',
+    height: '100%',
+  },
+  cardImageFallback: {
+    width: '100%',
+    height: 160,
+    borderRadius: 16,
+    marginTop: 44,
+    marginBottom: 4,
+    backgroundColor: '#F8FAFC',
+    borderWidth: 1,
+    borderColor: '#E2E8F0',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+  },
+  cardImageFallbackText: {
+    fontSize: 12,
+    color: COLORS.TEXT_SECONDARY,
+    fontWeight: '600',
   },
   ipaText: {
     fontSize: 17,
@@ -747,6 +1142,11 @@ const styles = StyleSheet.create({
     color: 'rgba(255,255,255,0.95)',
     lineHeight: 20,
   },
+  exampleMissing: {
+    fontSize: 14,
+    color: 'rgba(255,255,255,0.9)',
+    fontStyle: 'italic',
+  },
   hintBack: {
     fontSize: 13,
     color: 'rgba(255,255,255,0.85)',
@@ -757,17 +1157,26 @@ const styles = StyleSheet.create({
     gap: 12,
     marginBottom: 16,
   },
-  btnUnknown: {
+  choiceBtnBase: {
     flex: 1,
+    minHeight: 68,
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
+    gap: 10,
+    borderRadius: 16,
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+  },
+  btnUnknown: {
     backgroundColor: '#FFFFFF',
     borderWidth: 2,
     borderColor: '#EF4444',
-    borderRadius: 14,
-    paddingVertical: 14,
+    shadowColor: '#EF4444',
+    shadowOffset: {width: 0, height: 2},
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 1,
   },
   btnUnknownText: {
     fontSize: 16,
@@ -775,14 +1184,43 @@ const styles = StyleSheet.create({
     color: '#EF4444',
   },
   btnKnown: {
-    flex: 1,
-    flexDirection: 'row',
+    backgroundColor: '#22C55E',
+    borderWidth: 2,
+    borderColor: '#22C55E',
+    shadowColor: '#16A34A',
+    shadowOffset: {width: 0, height: 3},
+    shadowOpacity: 0.18,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  choiceIconWrapUnknown: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#FEE2E2',
     alignItems: 'center',
     justifyContent: 'center',
-    gap: 8,
-    backgroundColor: '#22C55E',
+  },
+  choiceIconWrapKnown: {
+    width: 28,
+    height: 28,
     borderRadius: 14,
-    paddingVertical: 14,
+    backgroundColor: 'rgba(255,255,255,0.2)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  choiceTextCol: {
+    alignItems: 'flex-start',
+  },
+  choiceSubTextUnknown: {
+    fontSize: 12,
+    color: '#B91C1C',
+    fontWeight: '600',
+  },
+  choiceSubTextKnown: {
+    fontSize: 12,
+    color: 'rgba(255,255,255,0.95)',
+    fontWeight: '600',
   },
   /** Đã lưu: Chưa biết — nền nhạt để thấy rõ đang chọn */
   btnUnknownSelected: {
@@ -797,7 +1235,7 @@ const styles = StyleSheet.create({
   },
   /** Nút kia đang được chọn — làm mờ nhẹ */
   btnChoiceMuted: {
-    opacity: 0.42,
+    opacity: 0.5,
   },
   btnKnownText: {
     fontSize: 16,
@@ -864,6 +1302,74 @@ const styles = StyleSheet.create({
   emptyText: {
     fontSize: 18,
     color: COLORS.TEXT_SECONDARY,
+  },
+  sheetOverlay: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(15,23,42,0.45)',
+  },
+  sheetWrap: {
+    backgroundColor: '#FFFFFF',
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    paddingHorizontal: 20,
+    paddingTop: 10,
+    paddingBottom: 8,
+  },
+  sheetHandle: {
+    alignSelf: 'center',
+    width: 40,
+    height: 4,
+    borderRadius: 2,
+    backgroundColor: '#E5E7EB',
+    marginBottom: 14,
+  },
+  sheetTitle: {
+    fontSize: 19,
+    fontWeight: '900',
+    color: COLORS.TEXT,
+    textAlign: 'center',
+    marginBottom: 8,
+  },
+  sheetSubtitle: {
+    fontSize: 14,
+    color: COLORS.TEXT_SECONDARY,
+    textAlign: 'center',
+    lineHeight: 20,
+    marginBottom: 16,
+    paddingHorizontal: 8,
+  },
+  sheetPrimaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: HEADER_ORANGE,
+    paddingVertical: 14,
+    borderRadius: 14,
+    marginBottom: 10,
+  },
+  sheetPrimaryBtnText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: '#FFFFFF',
+  },
+  sheetSecondaryBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingVertical: 14,
+    borderRadius: 14,
+    borderWidth: 2,
+    borderColor: COLORS.BORDER,
+    backgroundColor: COLORS.BACKGROUND,
+    marginBottom: 4,
+  },
+  sheetSecondaryBtnText: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: COLORS.PRIMARY_DARK,
   },
 });
 

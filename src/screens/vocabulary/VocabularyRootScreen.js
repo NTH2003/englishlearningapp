@@ -3,15 +3,9 @@ import {View, Text, StyleSheet, TouchableOpacity} from 'react-native';
 import {useFocusEffect, useNavigation, useRoute} from '@react-navigation/native';
 import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
 import {COLORS} from '../../constants';
-import {emitLearningProgressUpdated} from '../../services/learningProgressEvents';
 import {VocabularyTabContext} from '../../contexts/VocabularyTabContext';
 import TopicSelectionScreen from './TopicSelectionScreen';
 import VocabularyReviewHubScreen from './VocabularyReviewHubScreen';
-
-const HERO_COPY = {
-  bundles: 'Chọn một bộ để học flashcard và các chế độ luyện tập.',
-  review: 'Ôn lại từ đã học, luyện trắc nghiệm và thử thách.',
-};
 
 /**
  * Tab Từ vựng: Bộ từ vựng | Ôn tập.
@@ -22,15 +16,13 @@ export default function VocabularyRootScreen() {
   const navigation = useNavigation();
   const route = useRoute();
   const [tab, setTab] = useState('bundles');
-  const [reviewKey, setReviewKey] = useState(0);
-  const [topicListRefreshTick, setTopicListRefreshTick] = useState(0);
+  const topicListRefreshTick = 0;
 
   useEffect(() => {
     const initial = route.params?.initialVocabTab;
     if (initial === 'review' || initial === 'bundles') {
       if (initial === 'review') {
         setTab('review');
-        setReviewKey((k) => k + 1);
       } else {
         setTab('bundles');
       }
@@ -40,19 +32,16 @@ export default function VocabularyRootScreen() {
     }
   }, [route.params?.initialVocabTab, navigation]);
 
+  // Khi rời tab Từ vựng rồi quay lại, luôn về tab mặc định "Bộ từ vựng".
   useFocusEffect(
     useCallback(() => {
-      setTopicListRefreshTick((n) => n + 1);
-      const id = requestAnimationFrame(() => {
-        emitLearningProgressUpdated();
-      });
-      return () => cancelAnimationFrame(id);
+      setTab('bundles');
+      return undefined;
     }, []),
   );
 
   const switchToReview = useCallback(() => {
     setTab('review');
-    setReviewKey((k) => k + 1);
   }, []);
 
   const ctx = useMemo(
@@ -69,7 +58,6 @@ export default function VocabularyRootScreen() {
       <SafeAreaView style={styles.safe} edges={['left', 'right', 'bottom']}>
         <View style={[styles.heroOrange, {paddingTop: Math.max(insets.top, 10)}]}>
           <Text style={styles.heroTitle}>Từ vựng</Text>
-          <Text style={styles.heroSubtitle}>{HERO_COPY[tab]}</Text>
           <View style={styles.pillWrap}>
             <TouchableOpacity
               style={[styles.pillSeg, tab === 'bundles' && styles.pillSegActive]}
@@ -107,7 +95,7 @@ export default function VocabularyRootScreen() {
           <View
             style={[styles.tabPane, tab !== 'review' && styles.tabPaneHidden]}
             pointerEvents={tab === 'review' ? 'auto' : 'none'}>
-            <VocabularyReviewHubScreen key={reviewKey} />
+            <VocabularyReviewHubScreen />
           </View>
         </View>
       </SafeAreaView>
@@ -132,13 +120,7 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontWeight: '800',
     color: '#FFFFFF',
-    marginBottom: 6,
-  },
-  heroSubtitle: {
-    fontSize: 13,
-    color: 'rgba(255,255,255,0.92)',
-    fontWeight: '500',
-    lineHeight: 18,
+    marginBottom: 2,
   },
   pillWrap: {
     flexDirection: 'row',

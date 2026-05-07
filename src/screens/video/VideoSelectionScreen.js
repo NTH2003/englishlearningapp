@@ -1,4 +1,4 @@
-import React, {useState, useCallback} from 'react';
+import React, {useState, useCallback, useEffect, useRef} from 'react';
 import {useFocusEffect} from '@react-navigation/native';
 import {
   View,
@@ -11,6 +11,7 @@ import {
   StatusBar,
   Platform,
   TextInput,
+  DeviceEventEmitter,
 } from 'react-native';
 import {
   SafeAreaView,
@@ -25,6 +26,7 @@ import {
   loadVocabularyFromFirebase,
   getVideoVocabLearnedStatsBatch,
 } from '../../services/vocabularyService';
+import {LEARNING_PROGRESS_UPDATED} from '../../services/learningProgressEvents';
 
 const TEXT_DARK = '#1F2937';
 
@@ -46,6 +48,7 @@ const VideoSelectionScreen = ({navigation}) => {
   const [activeFilter, setActiveFilter] = useState('unwatched');
   const [searchQuery, setSearchQuery] = useState('');
   const [initialLoading, setInitialLoading] = useState(true);
+  const [isLoadingData, setIsLoadingData] = useState(false);
   const [videos, setVideos] = useState(() =>
     getAllVideos().map((v) => ({
       ...v,
@@ -55,8 +58,19 @@ const VideoSelectionScreen = ({navigation}) => {
       vocabTotal: 0,
     })),
   );
+  const videosRef = useRef(videos);
+  const isLoadingDataRef = useRef(false);
+
+  useEffect(() => {
+    videosRef.current = videos;
+  }, [videos]);
 
   const loadVideos = useCallback(async () => {
+    if (isLoadingDataRef.current) {
+      return;
+    }
+    isLoadingDataRef.current = true;
+    setIsLoadingData(true);
     const withTimeout = (p, ms) =>
       Promise.race([
         p,
@@ -64,6 +78,15 @@ const VideoSelectionScreen = ({navigation}) => {
       ]);
 
     const buildList = (progress, sourceVideos = []) => {
+      const previousStatsById = new Map(
+        videosRef.current.map((v) => [
+          String(v.id),
+          {
+            vocabLearned: Number(v.vocabLearned) || 0,
+            vocabTotal: Number(v.vocabTotal) || 0,
+          },
+        ]),
+      );
       const watchedArr = Array.isArray(progress?.videosWatched)
         ? progress.videosWatched
         : [];
@@ -73,12 +96,14 @@ const VideoSelectionScreen = ({navigation}) => {
       const watchedSet = new Set(watchedArr.map((x) => String(x)));
       const needPracticeSet = new Set(needPracticeArr.map((x) => String(x)));
       return sourceVideos.map((v) => {
+        const prev = previousStatsById.get(String(v.id));
         return {
           ...v,
           watched: watchedSet.has(String(v.id)),
           needsPractice: needPracticeSet.has(String(v.id)),
-          vocabLearned: 0,
-          vocabTotal: 0,
+          // Giữ stats cũ trong lúc reload để tránh nhấp nháy "chưa có từ" <-> "đã học x/y từ".
+          vocabLearned: prev?.vocabLearned ?? 0,
+          vocabTotal: prev?.vocabTotal ?? 0,
         };
       });
     };
@@ -91,7 +116,7 @@ const VideoSelectionScreen = ({navigation}) => {
 
     // 1) Luôn cố lấy danh sách video trước.
     try {
-      await withTimeout(loadVideosFromFirebase(), 5000);
+      await withTimeout(loadVideosFromFirebase(), 10000);
     } catch (_) {}
 
     // 2) Dựng danh sách cơ bản ngay, không phụ thuộc các bước khác.
@@ -99,7 +124,7 @@ const VideoSelectionScreen = ({navigation}) => {
     if (!Array.isArray(sourceVideos) || sourceVideos.length === 0) {
       try {
         await new Promise((r) => setTimeout(r, 1200));
-        await withTimeout(loadVideosFromFirebase({force: true}), 4000);
+        await withTimeout(loadVideosFromFirebase({force: true}), 10000);
         sourceVideos = getAllVideos();
       } catch (_) {}
     }
@@ -109,27 +134,46 @@ const VideoSelectionScreen = ({navigation}) => {
       setInitialLoading(false);
     }
 
-    // 3) Tiến độ xem video lỗi thì bỏ qua, vẫn hiển thị danh sách.
+    // 3) Lấy tiến độ local/default trước để cập nhật tức thì trạng thái Đã xem/Cần luyện.
     try {
-      const serverProgress = await withTimeout(
-        getLearningProgress({source: 'server'}),
-        8000,
-      );
-      baseList = buildList(serverProgress || null, sourceVideos);
+      const localProgress = await withTimeout(getLearningProgress(), 2500);
+      baseList = buildList(localProgress || null, sourceVideos);
+      setVideos(baseList);
     } catch (_) {}
+
+    // 3b) Đồng bộ server ở nền, không chặn UI.
+    void (async () => {
+      try {
+        const serverProgress = await withTimeout(
+          getLearningProgress({source: 'server'}),
+          8000,
+        );
+        if (!serverProgress) return;
+        const nextList = buildList(serverProgress, sourceVideos);
+        setVideos((prev) =>
+          applyVocabStatsToVideos(nextList, prev.map((v) => ({
+            videoId: v.id,
+            learned: Number(v.vocabLearned) || 0,
+            total: Number(v.vocabTotal) || 0,
+          }))),
+        );
+      } catch (_) {}
+    })();
 
     // 4) Từ vựng/stat — luôn tắt initialLoading trong finally (tránh kẹt khi baseList rỗng + return sớm).
     try {
-      await withTimeout(loadVocabularyFromFirebase(), 5000);
+      await withTimeout(loadVocabularyFromFirebase(), 10000);
       const stats = await withTimeout(
         getVideoVocabLearnedStatsBatch(baseList),
-        10000,
+        12000,
       );
       setVideos(applyVocabStatsToVideos(baseList, stats));
     } catch (_) {
       setVideos(baseList);
     } finally {
       setInitialLoading(false);
+      isLoadingDataRef.current = false;
+      setIsLoadingData(false);
     }
   }, []);
 
@@ -145,6 +189,13 @@ const VideoSelectionScreen = ({navigation}) => {
       };
     }, [loadVideos]),
   );
+
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener(LEARNING_PROGRESS_UPDATED, () => {
+      void loadVideos();
+    });
+    return () => sub.remove();
+  }, [loadVideos]);
 
   const onRefresh = useCallback(async () => {
     setRefreshing(true);
@@ -177,62 +228,52 @@ const VideoSelectionScreen = ({navigation}) => {
   const renderVideoCard = (video) => (
     <TouchableOpacity
       key={video.id}
-      style={styles.listRow}
+      style={styles.cardWrap}
       onPress={() => handleSelectVideo(video)}
       activeOpacity={0.85}>
-      <View style={styles.listThumbWrap}>
-        <View style={styles.listThumb}>
-          {video.thumbnailUrl &&
-          String(video.thumbnailUrl).trim().startsWith('http') ? (
-            <Image
-              source={{uri: String(video.thumbnailUrl).trim()}}
-              style={styles.listThumbImage}
-              resizeMode="cover"
-            />
-          ) : (
-            <LinearGradient
-              colors={['#EEF2F7', '#E5E7EB']}
-              style={StyleSheet.absoluteFill}>
-              <View style={styles.listThumbPlaceholder} />
-            </LinearGradient>
-          )}
-          {video.watched && (
-            <View style={styles.watchedBadge}>
-              <Feather name="check" size={12} color="#FFFFFF" />
-            </View>
-          )}
-          <View style={styles.listDurationPill}>
-            <Text style={styles.listDurationText}>{video.duration}</Text>
-          </View>
+      <View style={styles.cardImageWrap}>
+        {video.thumbnailUrl &&
+        String(video.thumbnailUrl).trim().startsWith('http') ? (
+          <Image
+            source={{uri: String(video.thumbnailUrl).trim()}}
+            style={styles.cardImage}
+            resizeMode="cover"
+          />
+        ) : (
+          <LinearGradient
+            colors={['#1F2937', '#111827']}
+            style={styles.cardImage}>
+            <View style={styles.listThumbPlaceholder} />
+          </LinearGradient>
+        )}
+        <View style={styles.cardChip}>
+          <Text style={styles.cardChipText} numberOfLines={1}>
+            {video.vocabTotal > 0
+              ? `${video.vocabLearned}/${video.vocabTotal} từ`
+              : 'Chưa có từ'}
+          </Text>
+        </View>
+        <View style={styles.cardDurationPill}>
+          <Text style={styles.cardDurationText}>{video.duration}</Text>
         </View>
       </View>
-      <View style={styles.listMain}>
-        <Text style={styles.listTitle} numberOfLines={2}>
+      <View style={styles.cardBody}>
+        <Text style={styles.cardTitle} numberOfLines={2}>
           {video.title}
         </Text>
-        {video.vocabTotal > 0 ? (
-          <View style={styles.listVocabRow}>
-            <Feather name="book-open" size={12} color={COLORS.PRIMARY_DARK} />
-            <Text style={styles.listVocabText}>
-              Đã học{' '}
-              <Text style={styles.listVocabFraction}>
-                {video.vocabLearned}/{video.vocabTotal}
-              </Text>{' '}
-              từ
+        <View style={styles.cardBottomRow}>
+          <View style={styles.watchStatusPill}>
+            <Text style={styles.watchStatusPillText}>
+              {video.needsPractice
+                ? 'Cần luyện tập'
+                : video.watched
+                  ? 'Đã xem'
+                  : 'Chưa xem'}
             </Text>
           </View>
-        ) : (
-          <Text style={styles.listVocabEmpty}>Chưa có từ trong video</Text>
-        )}
-        <Text style={styles.watchStatus}>
-          {video.needsPractice
-            ? 'Cần luyện tập'
-            : video.watched
-              ? 'Đã xem'
-              : 'Chưa xem'}
-        </Text>
+          <Feather name="chevron-right" size={18} color={COLORS.TEXT_LIGHT} />
+        </View>
       </View>
-      <Feather name="chevron-right" size={22} color={COLORS.TEXT_LIGHT} />
     </TouchableOpacity>
   );
 
@@ -246,7 +287,6 @@ const VideoSelectionScreen = ({navigation}) => {
       <View style={styles.stickyTop}>
         <View style={[styles.heroOrange, {paddingTop: heroPadTop}]}>
           <Text style={styles.heroTitle}>Video học tập</Text>
-          <Text style={styles.heroSubtitle}>Học tiếng Anh qua video sinh động</Text>
         </View>
       </View>
 
@@ -409,17 +449,11 @@ const styles = StyleSheet.create({
     fontSize: 27,
     fontWeight: '800',
     color: '#FFFFFF',
-    marginBottom: 6,
+    marginBottom: 2,
     letterSpacing: -0.3,
     textShadowColor: 'rgba(0,0,0,0.12)',
     textShadowOffset: {width: 0, height: 1},
     textShadowRadius: 2,
-  },
-  heroSubtitle: {
-    fontSize: 14,
-    color: 'rgba(255,255,255,0.95)',
-    fontWeight: '500',
-    lineHeight: 20,
   },
   searchRow: {
     marginHorizontal: 16,
@@ -461,109 +495,94 @@ const styles = StyleSheet.create({
     color: COLORS.TEXT_SECONDARY,
     fontWeight: '600',
   },
-  listRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
+  cardWrap: {
     backgroundColor: COLORS.BACKGROUND_WHITE,
     marginHorizontal: 16,
     marginBottom: 10,
     borderRadius: 16,
-    paddingVertical: 11,
-    paddingHorizontal: 12,
-    gap: 11,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: 'rgba(0,0,0,0.05)',
-    shadowColor: '#000',
-    shadowOffset: {width: 0, height: 2},
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
-  },
-  listThumbWrap: {
-    width: 100,
-  },
-  listThumb: {
-    height: 70,
-    borderRadius: 12,
-    justifyContent: 'center',
-    alignItems: 'center',
     overflow: 'hidden',
-    backgroundColor: '#FFF5EB',
+    borderWidth: 1,
+    borderColor: COLORS.BORDER,
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 3},
+    shadowOpacity: 0.1,
+    shadowRadius: 10,
+    elevation: 3,
   },
-  listThumbImage: {
+  /** Ngắn hơn 16:9 (~−14% chiều cao thumb) — danh sách gọn hơn. */
+  cardImageWrap: {
+    width: '100%',
+    aspectRatio: 2.05,
+    backgroundColor: '#111827',
+    position: 'relative',
+  },
+  cardImage: {
     width: '100%',
     height: '100%',
+  },
+  cardChip: {
+    position: 'absolute',
+    left: 8,
+    bottom: 8,
+    backgroundColor: 'rgba(253, 231, 235, 0.94)',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    maxWidth: '72%',
+  },
+  cardChipText: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#A61E4D',
+  },
+  cardDurationPill: {
+    position: 'absolute',
+    right: 8,
+    bottom: 8,
+    backgroundColor: 'rgba(15, 23, 42, 0.78)',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+  },
+  cardDurationText: {
+    color: '#fff',
+    fontSize: 10,
+    fontWeight: '800',
+    fontVariant: ['tabular-nums'],
+  },
+  cardBody: {
+    backgroundColor: '#FFFFFF',
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  cardTitle: {
+    fontSize: 16,
+    lineHeight: 21,
+    fontWeight: '800',
+    color: '#0F172A',
+    marginBottom: 6,
+    letterSpacing: -0.25,
+  },
+  cardBottomRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+  },
+  watchStatusPill: {
+    backgroundColor: '#F1F5F9',
+    borderRadius: 999,
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+  },
+  watchStatusPillText: {
+    color: '#64748B',
+    fontSize: 11,
+    fontWeight: '700',
   },
   listThumbPlaceholder: {
     flex: 1,
     backgroundColor: 'transparent',
-  },
-  watchedBadge: {
-    position: 'absolute',
-    top: 6,
-    left: 6,
-    width: 22,
-    height: 22,
-    borderRadius: 11,
-    backgroundColor: '#22C55E',
-    justifyContent: 'center',
-    alignItems: 'center',
-    zIndex: 2,
-  },
-  listDurationPill: {
-    position: 'absolute',
-    bottom: 4,
-    right: 4,
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    borderRadius: 4,
-  },
-  listDurationText: {
-    color: '#FFF',
-    fontSize: 10,
-    fontWeight: '700',
-  },
-  listMain: {
-    flex: 1,
-    minWidth: 0,
-  },
-  listTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: TEXT_DARK,
-    marginBottom: 4,
-    letterSpacing: -0.15,
-  },
-  listVocabRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    alignSelf: 'flex-start',
-    gap: 5,
-    marginBottom: 3,
-    paddingHorizontal: 8,
-    paddingVertical: 3,
-    borderRadius: 8,
-    backgroundColor: COLORS.PRIMARY_SOFT,
-  },
-  listVocabText: {
-    fontSize: 11,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
-  },
-  listVocabFraction: {
-    color: COLORS.PRIMARY_DARK,
-    fontWeight: '800',
-  },
-  listVocabEmpty: {
-    fontSize: 10,
-    color: COLORS.TEXT_LIGHT,
-    marginBottom: 3,
-  },
-  watchStatus: {
-    fontSize: 11,
-    color: COLORS.TEXT_SECONDARY,
-    fontWeight: '600',
   },
   emptyHint: {
     textAlign: 'center',

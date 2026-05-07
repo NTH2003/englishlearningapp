@@ -94,10 +94,6 @@ const FlashcardResultScreen = ({route}) => {
         </View>
 
         <View style={styles.statsRow}>
-          <View style={[styles.statBox, styles.statBoxTotal]}>
-            <Text style={styles.statNum}>{total}</Text>
-            <Text style={styles.statLbl}>Từ đã xem</Text>
-          </View>
           <View style={[styles.statBox, styles.statBoxOk]}>
             <Text style={styles.statNum}>{remembered}</Text>
             <Text style={styles.statLbl}>Đã nhớ</Text>
@@ -236,14 +232,6 @@ const styles = StyleSheet.create({
     marginTop: 6,
     textAlign: 'center',
   },
-  heroHint: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: 'center',
-    marginTop: 8,
-    lineHeight: 20,
-    paddingHorizontal: 8,
-  },
   statsRow: {
     flexDirection: 'row',
     gap: 10,
@@ -256,10 +244,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     alignItems: 'center',
     borderWidth: 1,
-  },
-  statBoxTotal: {
-    backgroundColor: '#F8FAFC',
-    borderColor: COLORS.BORDER,
   },
   statBoxOk: {
     backgroundColor: '#ECFDF5',

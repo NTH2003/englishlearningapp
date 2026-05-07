@@ -22,6 +22,23 @@ function normalizeVideoId(raw) {
   return s;
 }
 
+function deriveCloudinaryThumbnailUrl(videoUrl) {
+  const raw = String(videoUrl || '').trim();
+  if (!raw) return '';
+  if (!raw.includes('/res.cloudinary.com/') || !raw.includes('/video/upload/')) {
+    return '';
+  }
+  try {
+    const withFrameTransform = raw.includes('/video/upload/so_')
+      ? raw
+      : raw.replace('/video/upload/', '/video/upload/so_1/');
+    const withoutExt = withFrameTransform.replace(/\.[^/.?]+(?=($|\?))/, '');
+    return `${withoutExt}.jpg`;
+  } catch (_) {
+    return '';
+  }
+}
+
 /**
  * Một dòng từ vựng chỉ thuộc video (không trùng id với kho từ theo chủ đề).
  * id ổn định: vw_{videoId}_{index}.
@@ -69,7 +86,9 @@ export function normalizeVideoFromFirestore(raw) {
   if (level) {
     out.level = level;
   }
-  const thumbUrl = String(raw.thumbnailUrl ?? '').trim();
+  const thumbUrl =
+    String(raw.thumbnailUrl ?? '').trim() ||
+    deriveCloudinaryThumbnailUrl(videoUrl);
   if (thumbUrl) {
     out.thumbnailUrl = thumbUrl;
   }

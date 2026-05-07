@@ -1,4 +1,4 @@
-import React, {useState, useCallback, useMemo} from 'react';
+import React, {useState, useCallback, useMemo, useEffect, useRef} from 'react';
 import {
   View,
   Text,
@@ -9,8 +9,11 @@ import {
   Modal,
   TextInput,
   Platform,
+  DeviceEventEmitter,
+  ActivityIndicator,
 } from 'react-native';
 import {useNavigation, useFocusEffect} from '@react-navigation/native';
+import {useIsFocused} from '@react-navigation/native';
 import LinearGradient from 'react-native-linear-gradient';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import Feather from 'react-native-vector-icons/Feather';
@@ -21,6 +24,9 @@ import {
   saveUserData,
 } from '../../services/storageService';
 import {getResolvableLearnedWordsCount} from '../../services/vocabularyService';
+import {preloadEssentialData} from '../../services/appDataBootstrap';
+import {getLevelInfo} from '../../services/levelService';
+import {LEARNING_PROGRESS_UPDATED} from '../../services/learningProgressEvents';
 
 function getAuthService() {
   try {
@@ -49,21 +55,41 @@ function formatXP(n) {
   return x.toLocaleString('vi-VN');
 }
 
-/** Cấp hiển thị kiểu game (1…99) từ XP — thanh tiến độ tới ngưỡng cấp sau. */
-function gameLevelFromXP(totalXP) {
-  const xp = Math.max(0, Number(totalXP) || 0);
-  const level = Math.max(1, Math.min(99, Math.floor(xp / 250) + 1));
-  const nextCap = level * 250;
-  const prevCap = (level - 1) * 250;
-  const span = Math.max(1, nextCap - prevCap);
-  const inSpan = Math.min(span, Math.max(0, xp - prevCap));
-  const pct = Math.round((inSpan / span) * 100);
-  return {level, nextCap, prevCap, pct, xp};
+function withTimeout(promise, ms, fallbackValue = null) {
+  return Promise.race([
+    promise,
+    new Promise((resolve) => setTimeout(() => resolve(fallbackValue), ms)),
+  ]);
+}
+
+function summarizeProgress(lp) {
+  if (!lp || typeof lp !== 'object') return null;
+  return {
+    xp: Math.max(0, Number(lp.totalXP) || Number(lp.totalXp) || Number(lp.xp) || 0),
+    words: Array.isArray(lp.wordsLearned) ? lp.wordsLearned.length : 0,
+    videos: Array.isArray(lp.videosWatched) ? lp.videosWatched.length : 0,
+    dialogues: Array.isArray(lp.dialoguesCompleted) ? lp.dialoguesCompleted.length : 0,
+    hasWordStats:
+      lp.wordStats && typeof lp.wordStats === 'object'
+        ? Object.keys(lp.wordStats).length > 0
+        : false,
+    hasDialogueStats:
+      lp.dialogueStats && typeof lp.dialogueStats === 'object'
+        ? Object.keys(lp.dialogueStats).length > 0
+        : false,
+  };
 }
 
 const ProfileScreen = () => {
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
+  const hasLoadedProfileOnceRef = useRef(false);
+  const hasAppliedMeaningfulProgressRef = useRef(false);
+  const bootstrapOnceRef = useRef(null);
+  const loadInFlightRef = useRef(null);
+  const profileReloadDebounceRef = useRef(null);
+  const isFocused = useIsFocused();
+  const [initialLoading, setInitialLoading] = useState(true);
   const [authUser, setAuthUser] = useState(null);
   const [totalXP, setTotalXP] = useState(0);
   const [learnedWordsCount, setLearnedWordsCount] = useState(0);
@@ -82,54 +108,259 @@ const ProfileScreen = () => {
     confirmPassword: '',
   });
 
-  const loadProfileData = useCallback(async () => {
+  const hasMeaningfulProfileProgress = useCallback((lp) => {
+    if (!lp || typeof lp !== 'object') return false;
+    const hasDialogueStats =
+      lp.dialogueStats && typeof lp.dialogueStats === 'object'
+        ? Object.keys(lp.dialogueStats).length > 0
+        : false;
+    const hasTopicPracticeStats =
+      lp.topicPracticeStats && typeof lp.topicPracticeStats === 'object'
+        ? Object.keys(lp.topicPracticeStats).length > 0
+        : false;
+    const hasWordStats =
+      lp.wordStats && typeof lp.wordStats === 'object'
+        ? Object.keys(lp.wordStats).length > 0
+        : false;
+    return (
+      (Number(lp.totalXP) || Number(lp.totalXp) || Number(lp.xp) || 0) > 0 ||
+      (Array.isArray(lp.wordsLearned) && lp.wordsLearned.length > 0) ||
+      (Array.isArray(lp.videosWatched) && lp.videosWatched.length > 0) ||
+      (Array.isArray(lp.dialoguesCompleted) && lp.dialoguesCompleted.length > 0) ||
+      hasDialogueStats ||
+      hasTopicPracticeStats ||
+      hasWordStats
+    );
+  }, []);
+
+  const applyProfileProgress = useCallback((lp) => {
+    const xp = Math.max(
+      0,
+      Number(lp?.totalXP) || Number(lp?.totalXp) || Number(lp?.xp) || 0,
+    );
+    setTotalXP(xp);
+    const rawWordsLearnedCount = Array.isArray(lp?.wordsLearned)
+      ? lp.wordsLearned.length
+      : 0;
+    // Hiển thị ngay số từ từ snapshot hiện có; số chính xác hơn sẽ cập nhật nền.
+    setLearnedWordsCount(rawWordsLearnedCount);
+    const vw = Array.isArray(lp?.videosWatched)
+      ? lp.videosWatched.length
+      : lp?.videoViewCounts && typeof lp.videoViewCounts === 'object'
+        ? Object.keys(lp.videoViewCounts).length
+        : 0;
+    const dc = Array.isArray(lp?.dialoguesCompleted)
+      ? lp.dialoguesCompleted.length
+      : lp?.dialogueStats && typeof lp.dialogueStats === 'object'
+        ? Object.keys(lp.dialogueStats).length
+        : 0;
+    setVideosWatchedCount(vw);
+    setDialoguesCompletedCount(dc);
+
+    // Tính lại learned words (lọc id mồ côi) ở nền để không chặn lần render đầu.
+    void (async () => {
+      try {
+        const resolved = await getResolvableLearnedWordsCount();
+        if (Number.isFinite(resolved) && resolved >= 0) {
+          setLearnedWordsCount(resolved);
+        }
+      } catch (_) {}
+    })();
+  }, []);
+
+  const loadProfileData = useCallback(async ({silent = false} = {}) => {
+    if (loadInFlightRef.current) {
+      return loadInFlightRef.current;
+    }
+    const runner = (async () => {
+    const dlog = (...args) => {
+      if (__DEV__) console.log('[ProfileScreen]', ...args);
+    };
+    const isFirstLoad = !hasLoadedProfileOnceRef.current;
+    if (isFirstLoad && !silent) setInitialLoading(true);
     const auth = getAuthService();
-    setAuthUser(auth ? auth.getCurrentUser() : null);
+    const authUserSnapshot = auth ? auth.getCurrentUser() : null;
+    setAuthUser(authUserSnapshot);
+    dlog('loadProfileData:start', {
+      isFirstLoad,
+      silent,
+      uid: authUserSnapshot?.uid || null,
+    });
     try {
-      const ud = await getUserData();
+      if (!bootstrapOnceRef.current) {
+        bootstrapOnceRef.current = preloadEssentialData().catch(() => null);
+      }
+      // Đồng bộ với HomeScreen: chờ preload hoàn tất trước khi đọc profile/progress.
+      const boot = await withTimeout(bootstrapOnceRef.current, 8000, null);
+      dlog('bootstrap:done', boot);
+
+      // Không chặn luồng progress bởi getUserData (hay bị chờ auth/network).
+      const userDataPromise = (async () => {
+        let ud = await withTimeout(getUserData().catch(() => null), 1800, null);
+        if (isFirstLoad && (!ud || typeof ud !== 'object')) {
+          await withTimeout(bootstrapOnceRef.current, 1200, null);
+          ud = await withTimeout(getUserData().catch(() => null), 1400, null);
+        }
+        if ((!ud || typeof ud !== 'object') && auth?.getUserData) {
+          ud = await withTimeout(auth.getUserData().catch(() => null), 1600, null);
+        }
+        return ud && typeof ud === 'object' ? ud : null;
+      })();
+
       const authUser = auth ? auth.getCurrentUser() : null;
       let name =
-        (ud && typeof ud === 'object'
-          ? String(ud.displayName || ud.name || '').trim() ||
-            (typeof ud.fullName === 'string' ? ud.fullName.trim() : '') ||
-            String(ud.nickname || ud.username || ud.profileName || '').trim()
-          : '') ||
+        (authUser?.displayName ? String(authUser.displayName).trim() : '') ||
+        (authUser?.email ? String(authUser.email).split('@')[0] : '') ||
+        '' ||
+        '' ||
         (authUser?.displayName ? String(authUser.displayName).trim() : '') ||
         '';
       setProfileName(name);
+
+      const ud = await userDataPromise;
+      dlog('userData:loaded', {
+        hasUserData: !!ud,
+        keys: ud && typeof ud === 'object' ? Object.keys(ud).slice(0, 8) : [],
+      });
+      const nameFromUd =
+        ud && typeof ud === 'object'
+          ? String(ud.displayName || ud.name || '').trim() ||
+            (typeof ud.fullName === 'string' ? ud.fullName.trim() : '') ||
+            String(ud.nickname || ud.username || ud.profileName || '').trim()
+          : '';
+      if (nameFromUd) {
+        setProfileName(nameFromUd);
+      }
     } catch (_) {
       setProfileName('');
     }
     try {
-      const lp = await getLearningProgress();
-      const xp = Math.max(0, Number(lp?.totalXP) || 0);
-      setTotalXP(xp);
-      let wl = 0;
-      try {
-        wl = await getResolvableLearnedWordsCount();
-      } catch (_) {
-        wl = Array.isArray(lp?.wordsLearned) ? lp.wordsLearned.length : 0;
+      const initialProgress = await getLearningProgress().catch(() => null);
+      let selected =
+        initialProgress && typeof initialProgress === 'object' ? initialProgress : {};
+      dlog('progress:default', summarizeProgress(initialProgress));
+      if (!hasMeaningfulProfileProgress(selected)) {
+        const fromCache = await getLearningProgress({source: 'cache'}).catch(() => null);
+        dlog('progress:cache', summarizeProgress(fromCache));
+        if (fromCache && typeof fromCache === 'object' && hasMeaningfulProfileProgress(fromCache)) {
+          selected = fromCache;
+        } else {
+          const fromServer = await getLearningProgress({source: 'server'}).catch(() => null);
+          dlog('progress:server', summarizeProgress(fromServer));
+          if (
+            fromServer &&
+            typeof fromServer === 'object' &&
+            hasMeaningfulProfileProgress(fromServer)
+          ) {
+            selected = fromServer;
+          }
+        }
       }
-      const vw = Array.isArray(lp?.videosWatched) ? lp.videosWatched.length : 0;
-      const dc = Array.isArray(lp?.dialoguesCompleted)
-        ? lp.dialoguesCompleted.length
-        : 0;
-      setLearnedWordsCount(wl);
-      setVideosWatchedCount(vw);
-      setDialoguesCompletedCount(dc);
+      if (!hasMeaningfulProfileProgress(selected)) {
+        const refresh = await getLearningProgress({forceRefresh: true}).catch(() => null);
+        dlog('progress:forceRefresh', summarizeProgress(refresh));
+        if (refresh && typeof refresh === 'object' && hasMeaningfulProfileProgress(refresh)) {
+          selected = refresh;
+        }
+      }
+      if (!hasMeaningfulProfileProgress(selected) && auth?.getLearningProgress) {
+        // Fallback trực tiếp firebaseService cho Profile (tránh phụ thuộc inflight state của storageService).
+        const directServer = await auth
+          .getLearningProgress({source: 'server'})
+          .catch(() => null);
+        dlog('progress:directServer', summarizeProgress(directServer));
+        if (
+          directServer &&
+          typeof directServer === 'object' &&
+          hasMeaningfulProfileProgress(directServer)
+        ) {
+          selected = directServer;
+        } else {
+          const directDefault = await auth.getLearningProgress().catch(() => null);
+          dlog('progress:directDefault', summarizeProgress(directDefault));
+          if (
+            directDefault &&
+            typeof directDefault === 'object' &&
+            hasMeaningfulProfileProgress(directDefault)
+          ) {
+            selected = directDefault;
+          }
+        }
+      }
+
+      if (selected && typeof selected === 'object' && hasMeaningfulProfileProgress(selected)) {
+        dlog('progress:selected', summarizeProgress(selected));
+        applyProfileProgress(selected);
+        hasAppliedMeaningfulProgressRef.current = true;
+      } else {
+        dlog('progress:not-meaningful', summarizeProgress(selected));
+      }
     } catch (_) {
-      setTotalXP(0);
-      setLearnedWordsCount(0);
-      setVideosWatchedCount(0);
-      setDialoguesCompletedCount(0);
+      // Giữ số liệu hiện tại để tránh "nhấp nháy về 0" khi lỗi tạm thời.
+      dlog('progress:error');
+    } finally {
+      if (isFirstLoad) {
+        hasLoadedProfileOnceRef.current = true;
+        setInitialLoading(false);
+      } else {
+        hasLoadedProfileOnceRef.current = true;
+      }
+      dlog('loadProfileData:done', {
+        initialLoading: false,
+        hasAppliedMeaningful: hasAppliedMeaningfulProgressRef.current,
+      });
     }
-  }, []);
+    })();
+    loadInFlightRef.current = runner;
+    try {
+      return await runner;
+    } finally {
+      if (loadInFlightRef.current === runner) {
+        loadInFlightRef.current = null;
+      }
+    }
+  }, [applyProfileProgress, hasMeaningfulProfileProgress]);
 
   useFocusEffect(
     useCallback(() => {
-      loadProfileData();
+      let cancelled = false;
+      void loadProfileData();
+      // Retry nhiều nhịp để bắt kịp lúc storage/firebase hydrate xong sau khi app vừa mở.
+      const retryTimers = [1200, 2500, 4200].map((ms) =>
+        setTimeout(() => {
+          if (cancelled || hasAppliedMeaningfulProgressRef.current) return;
+          void loadProfileData({silent: true});
+        }, ms),
+      );
+      return () => {
+        cancelled = true;
+        retryTimers.forEach(clearTimeout);
+      };
     }, [loadProfileData]),
   );
+
+  useEffect(() => {
+    const sub = DeviceEventEmitter.addListener(
+      LEARNING_PROGRESS_UPDATED,
+      () => {
+        if (!isFocused) return;
+        if (profileReloadDebounceRef.current) {
+          clearTimeout(profileReloadDebounceRef.current);
+        }
+        profileReloadDebounceRef.current = setTimeout(() => {
+          profileReloadDebounceRef.current = null;
+          void loadProfileData({silent: true});
+        }, 500);
+      },
+    );
+    return () => {
+      sub.remove();
+      if (profileReloadDebounceRef.current) {
+        clearTimeout(profileReloadDebounceRef.current);
+        profileReloadDebounceRef.current = null;
+      }
+    };
+  }, [isFocused, loadProfileData]);
 
   const isLoggedIn = authUser && !authUser.isAnonymous;
   const displayName = useMemo(() => {
@@ -147,7 +378,12 @@ const ProfileScreen = () => {
     return formatJoinDate(created);
   }, [authUser]);
 
-  const gameLv = useMemo(() => gameLevelFromXP(totalXP), [totalXP]);
+  const levelInfo = useMemo(() => getLevelInfo(totalXP || 0), [totalXP]);
+  const currentLevelNumber = levelInfo.levelIndex + 1;
+  const levelRange = Math.max(1, levelInfo.maxXP - levelInfo.minXP);
+  const levelProgressText = levelInfo.isMaxLevel
+    ? `${formatXP(levelInfo.inLevelXP)}+ XP`
+    : `${formatXP(levelInfo.inLevelXP)}/${formatXP(levelRange)} XP`;
 
   const handleLoginPress = useCallback(() => {
     navigation.navigate('Login');
@@ -255,6 +491,12 @@ const ProfileScreen = () => {
         start={{x: 0, y: 0}}
         end={{x: 0, y: 1}}
         style={[styles.profileGradient, {paddingTop: insets.top + 8}]}>
+        {initialLoading ? (
+          <View style={styles.profileLoadingOverlay} pointerEvents="none">
+            <ActivityIndicator size="large" color={COLORS.PRIMARY_DARK} />
+            <Text style={styles.profileLoadingText}>Đang tải dữ liệu...</Text>
+          </View>
+        ) : null}
         <View style={styles.profileHeaderRow}>
           <Text style={styles.profileHeaderTitle}>Trang cá nhân</Text>
         </View>
@@ -266,7 +508,7 @@ const ProfileScreen = () => {
                 <Text style={styles.avatarEmoji}>👤</Text>
               </View>
               <View style={styles.avatarLevelBadge}>
-                <Text style={styles.avatarLevelBadgeText}>{gameLv.level}</Text>
+                <Text style={styles.avatarLevelBadgeText}>{currentLevelNumber}</Text>
               </View>
             </View>
             <View style={styles.profileHeroTextCol}>
@@ -275,7 +517,7 @@ const ProfileScreen = () => {
               </Text>
               <View style={styles.profileMetaRow}>
                 <View style={styles.levelPill}>
-                  <Text style={styles.levelPillText}>Level {gameLv.level}</Text>
+                  <Text style={styles.levelPillText}>Cấp {currentLevelNumber}</Text>
                 </View>
                 <Text style={styles.joinDateText}>
                   Tham gia {joinDateStr}
@@ -287,15 +529,17 @@ const ProfileScreen = () => {
           <View style={styles.xpBlock}>
             <View style={styles.xpBlockHeader}>
               <Text style={styles.xpBlockTitle}>
-                Tiến độ Level {gameLv.level + 1}
+                {levelInfo.isMaxLevel
+                  ? 'Bạn đã đạt cấp độ tối đa'
+                  : `Tiến độ Cấp ${currentLevelNumber + 1}`}
               </Text>
               <Text style={styles.xpBlockNums}>
-                {formatXP(gameLv.xp)}/{formatXP(gameLv.nextCap)} XP
+                {levelProgressText}
               </Text>
             </View>
             <View style={styles.xpBarTrack}>
               <View
-                style={[styles.xpBarFill, {width: `${gameLv.pct}%`}]}
+                style={[styles.xpBarFill, {width: `${levelInfo.progressPercent}%`}]}
               />
             </View>
           </View>
@@ -811,6 +1055,25 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     color: '#E11D48',
+  },
+
+  profileLoadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.55)',
+    paddingHorizontal: 18,
+  },
+  profileLoadingText: {
+    marginTop: 12,
+    fontSize: 15,
+    fontWeight: '800',
+    color: COLORS.TEXT,
+    textAlign: 'center',
   },
 
   modalOverlay: {

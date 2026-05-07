@@ -9,26 +9,106 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 dotenv.config({path: path.join(__dirname, '.env')});
 import cors from 'cors';
-import {GoogleGenerativeAI} from '@google/generative-ai';
 
 const app = express();
 app.use(cors());
 app.use(express.json({limit: '1mb'}));
 
 const port = Number(process.env.PORT) || 3001;
-const apiKey = process.env.GEMINI_API_KEY;
+const openaiApiKey = String(process.env.OPENAI_API_KEY || '').trim();
+const openaiModel = String(process.env.OPENAI_MODEL || '').trim() || 'gpt-4o-mini';
 const deepgramApiKey = process.env.DEEPGRAM_API_KEY;
-
-if (!apiKey) {
+const pexelsApiKey = String(process.env.PEXELS_API_KEY || '').trim();
+const ollamaBaseUrl =
+  String(process.env.OLLAMA_BASE_URL || '').trim() || 'http://127.0.0.1:11434';
+const ollamaModel =
+  String(process.env.OLLAMA_MODEL || '').trim() || 'llama3.1:8b';
+if (!openaiApiKey) {
   console.warn(
-    '[ai-server] Missing GEMINI_API_KEY. Copy .env.example to .env and set your key.',
+    '[ai-server] Missing OPENAI_API_KEY. AI endpoints will fallback to Ollama.',
   );
 }
 
-const genAI = new GoogleGenerativeAI(apiKey || '');
-
 function safeString(x, max = 2000) {
   return String(x ?? '').slice(0, max);
+}
+
+async function callOllamaJson(prompt) {
+  const url = `${ollamaBaseUrl.replace(/\/+$/, '')}/api/chat`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      model: ollamaModel,
+      stream: false,
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are an English conversation partner for learners in a mobile app. ' +
+            'Return ONLY valid JSON. No markdown. No explanations.',
+        },
+        {role: 'user', content: prompt},
+      ],
+      options: {temperature: 0.6, num_predict: 140},
+    }),
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      json?.error ||
+        `Ollama error (${resp.status}). Is Ollama running at ${ollamaBaseUrl}?`,
+    );
+  }
+  const raw = json?.message?.content || '{}';
+  try {
+    return JSON.parse(extractJsonObject(raw));
+  } catch (_) {
+    return {replyText: String(raw), done: false};
+  }
+}
+
+async function callOpenAIJson(prompt, options = {}) {
+  if (!openaiApiKey) {
+    throw new Error('Missing OPENAI_API_KEY');
+  }
+  const temperature = Math.max(
+    0,
+    Math.min(2, Number(options?.temperature ?? 0.7) || 0.7),
+  );
+  const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${openaiApiKey}`,
+    },
+    body: JSON.stringify({
+      model: openaiModel,
+      temperature,
+      response_format: {type: 'json_object'},
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are an English conversation partner for learners in a mobile app. ' +
+            'Return ONLY valid JSON. No markdown. No explanations.',
+        },
+        {role: 'user', content: prompt},
+      ],
+    }),
+  });
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      json?.error?.message || `OpenAI error (${resp.status})`,
+    );
+  }
+  const raw = safeString(json?.choices?.[0]?.message?.content || '{}', 6000);
+  try {
+    return JSON.parse(extractJsonObject(raw));
+  } catch (_) {
+    return {replyText: raw, done: false};
+  }
 }
 
 function extractJsonObject(text) {
@@ -44,32 +124,6 @@ function extractJsonObject(text) {
     return unfenced.slice(first, last + 1);
   }
   return unfenced;
-}
-
-let cachedModels = null;
-let cachedModelsAt = 0;
-async function listModels() {
-  const now = Date.now();
-  if (cachedModels && now - cachedModelsAt < 10 * 60 * 1000) return cachedModels;
-  const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(
-    apiKey || '',
-  )}`;
-  const resp = await fetch(url);
-  const json = await resp.json().catch(() => ({}));
-  if (!resp.ok) {
-    throw new Error(
-      json?.error?.message || `ListModels failed (${resp.status})`,
-    );
-  }
-  const models = Array.isArray(json?.models) ? json.models : [];
-  cachedModels = models;
-  cachedModelsAt = now;
-  return models;
-}
-
-function normalizeModelName(name) {
-  const s = String(name || '');
-  return s.startsWith('models/') ? s.slice('models/'.length) : s;
 }
 
 function formatSecondsToTimestamp(totalSeconds) {
@@ -150,6 +204,94 @@ function cleanLineForExplain(raw) {
   return String(raw || '').replace(/\s+/g, ' ').trim().slice(0, 220);
 }
 
+const SUGGESTION_STOPWORDS = new Set([
+  'the',
+  'a',
+  'an',
+  'and',
+  'or',
+  'to',
+  'of',
+  'for',
+  'with',
+  'is',
+  'are',
+  'am',
+  'i',
+  'you',
+  'we',
+  'they',
+  'he',
+  'she',
+  'it',
+  'my',
+  'your',
+  'our',
+  'their',
+  'in',
+  'on',
+  'at',
+  'this',
+  'that',
+  'please',
+  'could',
+  'would',
+  'can',
+  'will',
+]);
+
+function extractIntentKeywords(text) {
+  const words = String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length >= 3 && !SUGGESTION_STOPWORDS.has(w));
+  return [...new Set(words)].slice(0, 8);
+}
+
+function looksGenericIntroSuggestion(s) {
+  const t = String(s || '').toLowerCase();
+  return (
+    t.includes('nice to meet you') ||
+    t.includes('i am') ||
+    t.includes("i'm") ||
+    t.includes('my name is')
+  );
+}
+
+function finalizeSuggestions(rawSuggestions, latestPartnerText) {
+  const intents = extractIntentKeywords(latestPartnerText);
+  const out = [];
+  const normalizedRaw = [];
+  for (const s of Array.isArray(rawSuggestions) ? rawSuggestions : []) {
+    const line = safeString(s, 140).trim();
+    if (!line) continue;
+    normalizedRaw.push(line);
+    // Loại câu quá generic nếu đối tác đang hỏi thông tin cụ thể.
+    if (
+      intents.length > 0 &&
+      looksGenericIntroSuggestion(line) &&
+      !/name/.test(String(latestPartnerText || '').toLowerCase())
+    ) {
+      continue;
+    }
+    const low = line.toLowerCase();
+    const intentHit =
+      intents.length === 0 ? true : intents.some((k) => low.includes(k));
+    if (!intentHit && intents.length > 0 && out.length < 2) {
+      // Chấp nhận tối đa 1-2 câu chưa hit keyword để vẫn tự nhiên.
+      continue;
+    }
+    out.push(line);
+    if (out.length >= 3) break;
+  }
+  if (out.length === 0 && normalizedRaw.length > 0) {
+    return normalizedRaw.slice(0, 3);
+  }
+  return out.slice(0, 3);
+}
+
 function normalizePartOfSpeechVi(raw) {
   const s = String(raw || '').trim().toLowerCase();
   if (!s) return 'phrase';
@@ -167,60 +309,50 @@ function normalizePartOfSpeechVi(raw) {
   return 'phrase';
 }
 
-async function pickModelName() {
-  const models = await listModels();
-  const candidates = models
-    .filter((m) =>
-      Array.isArray(m?.supportedGenerationMethods)
-        ? m.supportedGenerationMethods.includes('generateContent')
-        : false,
-    )
-    .map((m) => normalizeModelName(m?.name));
-
-  const preferredOrder = [
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-8b',
-    'gemini-1.5-pro',
-    'gemini-1.0-pro',
-  ];
-
-  for (const p of preferredOrder) {
-    const found = candidates.find((c) => c === p || c.startsWith(`${p}-`));
-    if (found) return found;
-  }
-  return candidates[0] || null;
-}
-
-async function pickModelCandidates() {
-  const models = await listModels();
-  const candidates = models
-    .filter((m) =>
-      Array.isArray(m?.supportedGenerationMethods)
-        ? m.supportedGenerationMethods.includes('generateContent')
-        : false,
-    )
-    .map((m) => normalizeModelName(m?.name));
-  const preferredOrder = [
-    'gemini-1.5-flash',
-    'gemini-1.5-flash-8b',
-    'gemini-1.5-pro',
-    'gemini-1.0-pro',
-  ];
-  const ordered = [];
-  for (const p of preferredOrder) {
-    const found = candidates.find((c) => c === p || c.startsWith(`${p}-`));
-    if (found && !ordered.includes(found)) {
-      ordered.push(found);
-    }
-  }
-  for (const c of candidates) {
-    if (!ordered.includes(c)) ordered.push(c);
-  }
-  return ordered;
-}
-
 app.get('/health', (_req, res) => {
   res.json({ok: true});
+});
+
+/**
+ * GET /media/pexels/search?query=...&perPage=1
+ * returns: { photos: [{ id, url, photographer, src: { medium, large, original } }] }
+ */
+app.get('/media/pexels/search', async (req, res) => {
+  try {
+    const query = safeString(req.query?.query, 120).trim();
+    const perPage = Math.min(5, Math.max(1, Number(req.query?.perPage) || 1));
+    if (!query) {
+      return res.status(400).json({error: 'Missing query'});
+    }
+    if (!pexelsApiKey) {
+      return res.status(500).json({error: 'Server missing PEXELS_API_KEY'});
+    }
+    const url =
+      `https://api.pexels.com/v1/search?query=${encodeURIComponent(query)}` +
+      `&per_page=${perPage}&orientation=landscape&size=medium`;
+    const resp = await fetch(url, {
+      headers: {Authorization: pexelsApiKey},
+    });
+    const json = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      return res.status(resp.status).json({
+        error: json?.error || `Pexels request failed (${resp.status})`,
+      });
+    }
+    const photos = (Array.isArray(json?.photos) ? json.photos : []).map((p) => ({
+      id: p?.id,
+      url: p?.url,
+      photographer: p?.photographer,
+      src: {
+        medium: p?.src?.medium || '',
+        large: p?.src?.large || '',
+        original: p?.src?.original || '',
+      },
+    }));
+    return res.json({photos});
+  } catch (e) {
+    return res.status(500).json({error: e?.message || 'Pexels proxy error'});
+  }
 });
 
 /**
@@ -390,9 +522,6 @@ app.post('/video/subtitles/mp4-auto', async (req, res) => {
  */
 app.post('/video/subtitles/enrich', async (req, res) => {
   try {
-    if (!apiKey) {
-      return res.status(500).json({error: 'Server missing GEMINI_API_KEY'});
-    }
     const rawLines = Array.isArray(req.body?.lines) ? req.body.lines : [];
     const seen = new Set();
     const lines = rawLines
@@ -411,7 +540,7 @@ app.post('/video/subtitles/enrich', async (req, res) => {
 
     const prompt = `
 Bạn là trợ lý ngôn ngữ cho app học tiếng Anh.
-Nhiệm vụ: với mỗi dòng tiếng Anh trong danh sách, trả về:
+Nhiệm vụ: với mỗi mục trong danh sách (mỗi mục là một từ hoặc cụm từ ngắn tiếng Anh, không phải cả câu), trả về:
 - meaning: nghĩa tiếng Việt tự nhiên, ngắn gọn
 - pronunciation: phiên âm gần đúng kiểu IPA đơn giản (vd: /həˈloʊ/)
 - partOfSpeechVi: part of speech in ENGLISH (prefer: noun, verb, adjective, adverb, pronoun, preposition, conjunction, interjection, phrase)
@@ -428,34 +557,18 @@ Trả về JSON:
 {"items":[{"text":"...","meaning":"...","pronunciation":"...","partOfSpeechVi":"..."}]}
 `.trim();
 
-    const modelCandidates = await pickModelCandidates();
-    if (!modelCandidates.length) {
-      throw new Error('No Gemini model available for generateContent.');
-    }
-    let result = null;
-    let lastErr = null;
-    for (const modelName of modelCandidates) {
+    let aiParsed = null;
+    if (openaiApiKey) {
       try {
-        const model = genAI.getGenerativeModel({
-          model: modelName,
-          generationConfig: {temperature: 0.2},
-        });
-        result = await model.generateContent(prompt);
-        if (result) break;
+        aiParsed = await callOpenAIJson(prompt, {temperature: 0.2});
       } catch (e) {
-        lastErr = e;
+        console.warn('[video/subtitles/enrich] OpenAI failed, fallback to Ollama:', e?.message);
       }
     }
-    if (!result) {
-      const rawMsg = String(lastErr?.message || '');
-      if (/503|unavailable|high demand|overloaded/i.test(rawMsg)) {
-        throw new Error(
-          'AI đang quá tải tạm thời. Vui lòng thử lại sau 30-60 giây.',
-        );
-      }
-      throw new Error(rawMsg || 'Cannot enrich subtitle lines.');
+    if (!aiParsed) {
+      aiParsed = await callOllamaJson(prompt);
     }
-    const raw = result?.response?.text?.() || '{}';
+    const raw = JSON.stringify(aiParsed || {});
     let parsed = {};
     try {
       parsed = JSON.parse(extractJsonObject(raw));
@@ -487,10 +600,6 @@ Trả về JSON:
  */
 app.post('/dialogue/chat', async (req, res) => {
   try {
-    if (!apiKey) {
-      return res.status(500).json({error: 'Server missing GEMINI_API_KEY'});
-    }
-
     const scenario = req.body?.scenario || {};
     const history = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const locale = req.body?.locale === 'vi' ? 'vi' : 'vi';
@@ -512,7 +621,7 @@ Scenario:
 
 Conversation so far (latest last):
 ${history
-  .slice(-20)
+  .slice(-10)
   .map((m) => `${m?.from === 'me' ? 'User' : 'Partner'}: ${safeString(m?.text, 300)}`)
   .join('\n')}
 
@@ -520,27 +629,18 @@ Return ONLY valid JSON:
 {"replyText": string, "done": boolean}
 `.trim();
 
-    const modelName = await pickModelName();
-    if (!modelName) {
-      throw new Error(
-        'No Gemini model available for generateContent. Check your API key/project.',
-      );
-    }
-
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      generationConfig: {
-        temperature: 0.7,
-      },
-    });
-
-    const result = await model.generateContent(prompt);
-    const raw = result?.response?.text?.() || '{}';
     let parsed = null;
-    try {
-      parsed = JSON.parse(extractJsonObject(raw));
-    } catch (_) {
-      parsed = {replyText: String(raw), done: false};
+    // 1) Prefer OpenAI for dialogue chat.
+    if (openaiApiKey) {
+      try {
+        parsed = await callOpenAIJson(prompt);
+      } catch (e) {
+        console.warn('[dialogue/chat] OpenAI failed, fallback to Ollama:', e?.message);
+      }
+    }
+    // 2) Fallback to Ollama (local) when OpenAI is missing/failed.
+    if (!parsed) {
+      parsed = await callOllamaJson(prompt);
     }
 
     const replyText = safeString(parsed?.replyText, 2000);
@@ -559,10 +659,6 @@ Return ONLY valid JSON:
  */
 app.post('/dialogue/suggestions', async (req, res) => {
   try {
-    if (!apiKey) {
-      return res.status(500).json({error: 'Server missing GEMINI_API_KEY'});
-    }
-
     const scenario = req.body?.scenario || {};
     const history = Array.isArray(req.body?.messages) ? req.body.messages : [];
     const latestPartner = [...history]
@@ -570,64 +666,104 @@ app.post('/dialogue/suggestions', async (req, res) => {
       .find((m) => m?.from === 'other' && String(m?.text || '').trim().length > 0);
 
     const prompt = `
-You are helping users practice English conversation in a mobile app.
-Generate suggested replies for the USER that directly answer ONLY the latest partner message.
+Create 3 short English replies for the USER.
 Rules:
-- Return exactly 3 suggestions in English.
-- Each suggestion is one short, natural sentence (8-16 words).
-- Suggestions MUST be specific to the latest partner question, not generic.
-- Avoid repeating earlier canned self-introduction lines unless latest question asks for it.
-- Use first-person voice ("I ...") where appropriate.
-- Keep tone friendly and realistic for conversation practice.
-- No numbering, no extra explanations.
+- Directly answer the latest partner message.
+- Natural conversation style, first-person when needed.
+- 8-14 words each.
+- Return ONLY JSON: {"suggestions":["...","...","..."]}
 
-Scenario:
-- Title: ${safeString(scenario.title, 200)}
-- Goal: ${safeString(scenario.goal, 400)}
-- Situation: ${safeString(scenario.situation, 600)}
-
-Latest partner message (MUST answer this):
-${safeString(latestPartner?.text, 500)}
-
-Recent conversation (latest last):
-${history
-  .slice(-12)
-  .map((m) => `${m?.from === 'me' ? 'User' : 'Partner'}: ${safeString(m?.text, 220)}`)
-  .join('\n')}
-
-Return ONLY valid JSON:
-{"suggestions": ["...", "...", "..."]}
+Scenario title: ${safeString(scenario.title, 120)}
+Goal: ${safeString(scenario.goal, 220)}
+Latest partner message: ${safeString(latestPartner?.text, 300)}
 `.trim();
 
-    const modelName = await pickModelName();
-    if (!modelName) {
-      throw new Error(
-        'No Gemini model available for generateContent. Check your API key/project.',
-      );
+    let suggestions = [];
+
+    if (openaiApiKey) {
+      try {
+        const parsed = await callOpenAIJson(prompt, {temperature: 0.65});
+        suggestions = finalizeSuggestions(
+          Array.isArray(parsed?.suggestions) ? parsed.suggestions : [],
+          latestPartner?.text || '',
+        );
+      } catch (e) {
+        console.warn('[dialogue/suggestions] OpenAI failed, fallback to Ollama:', e?.message);
+      }
     }
 
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      generationConfig: {
-        temperature: 0.65,
-      },
-    });
-
-    const result = await model.generateContent(prompt);
-    const raw = result?.response?.text?.() || '{}';
-    let parsed = null;
-    try {
-      parsed = JSON.parse(extractJsonObject(raw));
-    } catch (_) {
-      parsed = {};
+    if (!suggestions.length) {
+      const ollamaParsed = await callOllamaJson(prompt);
+      const ollamaSuggestions = Array.isArray(ollamaParsed?.suggestions)
+        ? ollamaParsed.suggestions
+        : [];
+      suggestions = finalizeSuggestions(ollamaSuggestions, latestPartner?.text || '');
+      if (!suggestions.length && typeof ollamaParsed?.replyText === 'string') {
+        suggestions = finalizeSuggestions([ollamaParsed.replyText], latestPartner?.text || '');
+      }
     }
 
-    const suggestions = Array.isArray(parsed?.suggestions)
-      ? parsed.suggestions
-          .map((s) => safeString(s, 140).trim())
+    // Fallback lần 2: yêu cầu Ollama trả về 3 dòng plain-text để tránh rỗng do JSON parse.
+    if (!suggestions.length) {
+      const plainPrompt = `
+Generate exactly 3 short English replies for the user.
+Rules:
+- Directly answer the partner's latest message.
+- One reply per line.
+- No numbering, no bullets, no JSON.
+
+Latest partner message:
+${safeString(latestPartner?.text, 500)}
+      `.trim();
+      try {
+        const plainParsed = await callOllamaJson(plainPrompt);
+        const plainRaw = safeString(
+          plainParsed?.replyText || plainParsed?.translation || '',
+          2000,
+        );
+        const lines = plainRaw
+          .split('\n')
+          .map((x) => String(x || '').trim())
           .filter(Boolean)
-          .slice(0, 3)
-      : [];
+          .map((x) => x.replace(/^[-*0-9.)\s]+/, '').trim())
+          .filter(Boolean)
+          .slice(0, 3);
+        suggestions = finalizeSuggestions(lines, latestPartner?.text || '');
+      } catch (_) {}
+    }
+
+    // Nếu AI chỉ trả 1-2 câu, yêu cầu AI bổ sung cho đủ 3 câu (vẫn 100% AI-generated).
+    if (suggestions.length > 0 && suggestions.length < 3) {
+      const fillPrompt = `
+You are generating conversation suggestions for learners.
+Current suggestions:
+${suggestions.map((s) => `- ${s}`).join('\n')}
+
+Generate ${3 - suggestions.length} additional suggestions so total becomes 3.
+Rules:
+- New suggestions must be different from existing ones.
+- One suggestion per line, no numbering, no bullets.
+- Directly answer the latest partner message.
+
+Latest partner message:
+${safeString(latestPartner?.text, 500)}
+      `.trim();
+      try {
+        const fillParsed = await callOllamaJson(fillPrompt);
+        const fillRaw = safeString(
+          fillParsed?.replyText || fillParsed?.translation || '',
+          2000,
+        );
+        const extra = fillRaw
+          .split('\n')
+          .map((x) => String(x || '').trim())
+          .filter(Boolean)
+          .map((x) => x.replace(/^[-*0-9.)\s]+/, '').trim())
+          .filter(Boolean);
+        const combined = [...suggestions, ...extra];
+        suggestions = finalizeSuggestions(combined, latestPartner?.text || '');
+      } catch (_) {}
+    }
 
     return res.json({suggestions});
   } catch (e) {
@@ -642,9 +778,6 @@ Return ONLY valid JSON:
  */
 app.post('/dialogue/translate', async (req, res) => {
   try {
-    if (!apiKey) {
-      return res.status(500).json({error: 'Server missing GEMINI_API_KEY'});
-    }
     const text = safeString(req.body?.text, 1200).trim();
     if (!text) {
       return res.status(400).json({error: 'Missing text'});
@@ -653,33 +786,96 @@ app.post('/dialogue/translate', async (req, res) => {
     const prompt = `
 Translate the English sentence below into natural Vietnamese.
 Rules:
-- Return ONLY the Vietnamese translation text.
-- Do not explain.
-- Do not add quotes.
+- Return ONLY valid JSON:
+{"translation":"..."}
 - Keep meaning faithful and concise.
 
 Sentence:
 ${text}
 `.trim();
 
-    const modelName = await pickModelName();
-    if (!modelName) {
-      throw new Error(
-        'No Gemini model available for generateContent. Check your API key/project.',
-      );
+    let translation = '';
+    if (openaiApiKey) {
+      try {
+        const parsed = await callOpenAIJson(prompt, {temperature: 0.1});
+        translation = safeString(parsed?.translation, 1500).trim();
+      } catch (e) {
+        console.warn('[dialogue/translate] OpenAI failed, fallback to Ollama:', e?.message);
+      }
     }
-    const model = genAI.getGenerativeModel({
-      model: modelName,
-      generationConfig: {temperature: 0.1},
-    });
-    const result = await model.generateContent(prompt);
-    const raw = safeString(result?.response?.text?.(), 2000).trim();
-    const translation = raw
-      .replace(/^["'`]+|["'`]+$/g, '')
-      .replace(/^dịch[:\-\s]*/i, '')
-      .replace(/^bản dịch[:\-\s]*/i, '')
-      .trim();
+
+    if (!translation) {
+      const parsed = await callOllamaJson(prompt);
+      translation =
+        safeString(parsed?.translation || parsed?.replyText, 1500)
+          .replace(/^["'`]+|["'`]+$/g, '')
+          .replace(/^dịch[:\-\s]*/i, '')
+          .replace(/^bản dịch[:\-\s]*/i, '')
+          .trim() || '';
+    }
+
     return res.json({translation});
+  } catch (e) {
+    return res.status(500).json({error: e?.message || 'AI server error'});
+  }
+});
+
+/**
+ * POST /dialogue/spellcheck
+ * body: { text: string }
+ * returns: { correctedText: string, explanationVi: string }
+ */
+app.post('/dialogue/spellcheck', async (req, res) => {
+  try {
+    const text = safeString(req.body?.text, 1200).trim();
+    if (!text) {
+      return res.status(400).json({error: 'Missing text'});
+    }
+
+    const prompt = `
+You help English learners fix spelling and obvious typing mistakes.
+Rules:
+- Keep the same meaning, intent, and tone (casual stays casual).
+- Fix spelling, capitalization at sentence starts, missing apostrophes, and clear wrong-word typos (their/there/they're, its/it's, etc.).
+- Do NOT rewrite style, add ideas, or make the message longer unless needed for correctness.
+- correctedText must remain English only (no Vietnamese inside correctedText).
+Return ONLY valid JSON:
+{"correctedText":"...", "explanationVi":"..."}
+
+explanationVi: one short sentence in Vietnamese summarizing what changed.
+If nothing meaningful changed, use correctedText equal to the original and explanationVi like "Không thấy lỗi chính tả cần sửa."
+
+Learner text:
+${text}
+`.trim();
+
+    let correctedText = '';
+    let explanationVi = '';
+
+    if (openaiApiKey) {
+      try {
+        const parsed = await callOpenAIJson(prompt, {temperature: 0.05});
+        correctedText = safeString(parsed?.correctedText, 1200).trim();
+        explanationVi = safeString(parsed?.explanationVi, 400).trim();
+      } catch (e) {
+        console.warn('[dialogue/spellcheck] OpenAI failed, fallback to Ollama:', e?.message);
+      }
+    }
+
+    if (!correctedText) {
+      const parsed = await callOllamaJson(prompt);
+      correctedText = safeString(parsed?.correctedText || parsed?.replyText, 1200).trim();
+      explanationVi = safeString(parsed?.explanationVi || parsed?.translation, 400).trim();
+    }
+
+    if (!correctedText) {
+      correctedText = text;
+    }
+    if (!explanationVi) {
+      explanationVi = 'Đã kiểm tra nhanh.';
+    }
+
+    return res.json({correctedText, explanationVi});
   } catch (e) {
     return res.status(500).json({error: e?.message || 'AI server error'});
   }

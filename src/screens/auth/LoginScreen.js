@@ -1,18 +1,19 @@
-import React, {useState, useCallback} from 'react';
+import React, {useState, useCallback, useEffect} from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TextInput,
   TouchableOpacity,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
   Alert,
 } from 'react-native';
-import {useNavigation} from '@react-navigation/native';
+import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
+import {useNavigation, useFocusEffect} from '@react-navigation/native';
 import LinearGradient from 'react-native-linear-gradient';
+import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
 import {THEME} from '../../theme';
 
@@ -26,12 +27,34 @@ function getAuthService() {
 
 const LoginScreen = () => {
   const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState('');
+  const isBusy = loading || googleLoading;
+
+  // Khi quay lại màn đăng nhập, reset form để tránh giữ dữ liệu cũ.
+  useFocusEffect(
+    useCallback(() => {
+      setEmail('');
+      setPassword('');
+      setShowPassword(false);
+      setError('');
+      return undefined;
+    }, []),
+  );
+
+  // Đang đăng nhập thì chặn điều hướng "back" để tránh state bị ngắt giữa chừng.
+  useEffect(() => {
+    const unsub = navigation.addListener('beforeRemove', (e) => {
+      if (!isBusy) return;
+      e.preventDefault();
+    });
+    return unsub;
+  }, [navigation, isBusy]);
 
   const handleLogin = useCallback(async () => {
     setError('');
@@ -95,18 +118,20 @@ const LoginScreen = () => {
     navigation.navigate('Register');
   }, [navigation]);
 
+  const heroTopPad = insets.top + 20;
+
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['bottom', 'left', 'right']}>
       <LinearGradient
         colors={THEME.gradient.hero}
         start={{x: 0, y: 0}}
         end={{x: 1, y: 1}}
-        style={styles.hero}>
+        style={[styles.hero, {paddingTop: heroTopPad}]}>
         <View style={styles.brandWrap}>
           <View style={styles.logoIcon}>
             <Text style={styles.logoEmoji}>📚</Text>
           </View>
-          <Text style={styles.brandTitle}>EasyEng</Text>
+          <Text style={styles.brandTitle}>EnglishApp</Text>
           <Text style={styles.brandSubtitle}>Học tiếng Anh mỗi ngày</Text>
         </View>
       </LinearGradient>
@@ -117,9 +142,6 @@ const LoginScreen = () => {
         <View style={styles.scrollContent}>
           <View style={[styles.card, THEME.shadow.card]}>
             <Text style={styles.cardTitle}>Đăng nhập</Text>
-            <Text style={styles.cardSubtitle}>
-              Nhập thông tin của bạn để tiếp tục
-            </Text>
 
             {error ? (
               <View style={styles.errorBox}>
@@ -131,10 +153,15 @@ const LoginScreen = () => {
             <View style={styles.fieldWrap}>
               <Text style={styles.label}>Email</Text>
               <View style={styles.inputWrap}>
-                <Text style={styles.inputIcon}>✉</Text>
+                <Feather
+                  name="mail"
+                  size={18}
+                  color={COLORS.TEXT_SECONDARY}
+                  style={styles.inputLeadingIcon}
+                />
                 <TextInput
                   style={styles.input}
-                  placeholder="name@example.com"
+                  placeholder="user@email.com"
                   placeholderTextColor={COLORS.TEXT_LIGHT}
                   value={email}
                   onChangeText={(v) => {
@@ -144,7 +171,7 @@ const LoginScreen = () => {
                   keyboardType="email-address"
                   autoCapitalize="none"
                   autoCorrect={false}
-                  editable={!loading && !googleLoading}
+                  editable={!isBusy}
                 />
               </View>
             </View>
@@ -153,10 +180,15 @@ const LoginScreen = () => {
             <View style={styles.fieldWrap}>
               <Text style={styles.label}>Mật khẩu</Text>
               <View style={styles.inputWrap}>
-                <Text style={styles.inputIcon}>🔒</Text>
+                <Feather
+                  name="lock"
+                  size={18}
+                  color={COLORS.TEXT_SECONDARY}
+                  style={styles.inputLeadingIcon}
+                />
                 <TextInput
                   style={[styles.input, styles.inputPassword]}
-                  placeholder="••••••••"
+                  placeholder="Mật khẩu"
                   placeholderTextColor={COLORS.TEXT_LIGHT}
                   value={password}
                   onChangeText={(v) => {
@@ -164,17 +196,21 @@ const LoginScreen = () => {
                     setError('');
                   }}
                   secureTextEntry={!showPassword}
-                  editable={!loading && !googleLoading}
+                  editable={!isBusy}
                 />
                 <TouchableOpacity
                   style={styles.eyeBtn}
                   onPress={() => setShowPassword(!showPassword)}
-                  disabled={loading || googleLoading}
+                  disabled={isBusy}
                   hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
+                  accessibilityRole="button"
+                  accessibilityLabel={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
                 >
-                  <Text style={styles.eyeIcon}>
-                    {showPassword ? '🙈' : '👁'}
-                  </Text>
+                  <Feather
+                    name={showPassword ? 'eye-off' : 'eye'}
+                    size={20}
+                    color={COLORS.TEXT_SECONDARY}
+                  />
                 </TouchableOpacity>
               </View>
             </View>
@@ -182,7 +218,7 @@ const LoginScreen = () => {
             {/* Forgot Password */}
             <View style={styles.forgotWrap}>
               <TouchableOpacity
-                disabled={loading || googleLoading}
+                disabled={isBusy}
                 onPress={() =>
                   Alert.alert(
                     'Quên mật khẩu',
@@ -198,10 +234,10 @@ const LoginScreen = () => {
             <TouchableOpacity
               style={[
                 styles.loginBtn,
-                loading && styles.loginBtnDisabled,
+                isBusy && styles.loginBtnDisabled,
               ]}
               onPress={handleLogin}
-              disabled={loading || googleLoading}
+              disabled={isBusy}
               activeOpacity={0.8}
             >
               {loading ? (
@@ -222,10 +258,10 @@ const LoginScreen = () => {
             <TouchableOpacity
               style={[
                 styles.googleBtn,
-                googleLoading && styles.googleBtnDisabled,
+                isBusy && styles.googleBtnDisabled,
               ]}
               onPress={handleGoogleLogin}
-              disabled={loading || googleLoading}
+              disabled={isBusy}
               activeOpacity={0.8}
             >
               {googleLoading ? (
@@ -243,20 +279,12 @@ const LoginScreen = () => {
               <Text style={styles.signupText}>Chưa có tài khoản? </Text>
               <TouchableOpacity
                 onPress={goToRegister}
-                disabled={loading || googleLoading}
+                disabled={isBusy}
               >
                 <Text style={styles.signupLink}>Đăng ký ngay</Text>
               </TouchableOpacity>
             </View>
           </View>
-
-          {/* Footer */}
-          <Text style={styles.footer}>
-            Bằng việc đăng nhập, bạn đồng ý với{' '}
-            <Text style={styles.footerLink}>Điều khoản sử dụng</Text>
-            {' '}và{' '}
-            <Text style={styles.footerLink}>Chính sách bảo mật</Text>
-          </Text>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -269,7 +297,6 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.BACKGROUND,
   },
   hero: {
-    paddingTop: 12,
     paddingBottom: 52,
     paddingHorizontal: 24,
     borderBottomLeftRadius: THEME.radius.xxl,
@@ -327,12 +354,9 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: COLORS.TEXT,
-    marginBottom: 4,
-  },
-  cardSubtitle: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
     marginBottom: 20,
+    textAlign: 'center',
+    width: '100%',
   },
   errorBox: {
     backgroundColor: COLORS.ERROR + '15',
@@ -364,10 +388,8 @@ const styles = StyleSheet.create({
     borderColor: COLORS.BORDER,
     paddingHorizontal: 12,
   },
-  inputIcon: {
-    fontSize: 16,
+  inputLeadingIcon: {
     marginRight: 10,
-    color: COLORS.TEXT_SECONDARY,
   },
   input: {
     flex: 1,
@@ -381,9 +403,8 @@ const styles = StyleSheet.create({
   },
   eyeBtn: {
     padding: 8,
-  },
-  eyeIcon: {
-    fontSize: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   forgotWrap: {
     alignItems: 'flex-end',
@@ -462,17 +483,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: COLORS.PRIMARY,
-  },
-  footer: {
-    marginTop: 24,
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: 'center',
-    paddingHorizontal: 16,
-  },
-  footerLink: {
-    textDecorationLine: 'underline',
-    color: COLORS.TEXT,
   },
 });
 

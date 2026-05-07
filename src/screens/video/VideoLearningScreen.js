@@ -27,10 +27,14 @@ import {
   loadVocabularyFromFirebase,
   getVideoWordsListForVideo,
   markWordAsLearned,
+  markWordsLearnedBatch,
   getVideoWordsLearnedMap,
+  buildVideoTokenMeaningLookup,
+  lookupVideoSubtitleToken,
 } from '../../services/vocabularyService';
+import {saveContinueLearning, CONTINUE_KIND} from '../../services/continueLearning';
 import {
-  addVideoWatched,
+  completeVideoAndAwardXP,
   incrementVideoViewCount,
   awardXPIfFirst,
   setVideoNeedsPractice,
@@ -39,11 +43,59 @@ import {XP} from '../../services/levelService';
 import {
   LEARNING_PROGRESS_UPDATED,
 } from '../../services/learningProgressEvents';
+import {translateEnglishToVietnamese} from '../../services/quickTranslate';
 
 const {width: SCREEN_WIDTH} = Dimensions.get('window');
 const VIDEO_WIDTH = SCREEN_WIDTH - 24;
 const VIDEO_HEIGHT = VIDEO_WIDTH * 0.5625;
 const RATES = [0.75, 1, 1.25, 1.5];
+
+/**
+ * Surface video tách riêng để tránh re-render player khi UI (caption/seekbar) cập nhật thời gian.
+ * Điều này giúp giảm nhấp nháy trên Android.
+ */
+const Mp4VideoSurface = React.memo(
+  React.forwardRef(function Mp4VideoSurface(
+    {
+      source,
+      style,
+      paused,
+      muted,
+      rate,
+      onLoad,
+      onProgress,
+      onEnd,
+      onError,
+    },
+    ref,
+  ) {
+    return (
+      <Video
+        ref={ref}
+        source={source}
+        style={style}
+        controls={false}
+        paused={paused}
+        muted={muted}
+        rate={rate}
+        resizeMode="contain"
+        hideShutterView
+        useTextureView
+        progressUpdateInterval={250}
+        bufferConfig={{
+          minBufferMs: 15000,
+          maxBufferMs: 50000,
+          bufferForPlaybackMs: 2500,
+          bufferForPlaybackAfterRebufferMs: 5000,
+        }}
+        onLoad={onLoad}
+        onProgress={onProgress}
+        onEnd={onEnd}
+        onError={onError}
+      />
+    );
+  }),
+);
 
 function isYouTubeUrl(uri) {
   if (!uri || typeof uri !== 'string') return false;
@@ -174,6 +226,30 @@ function formatTime(seconds) {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 }
 
+/** Tách phụ đề thành khoảng trắng / từ tiếng Anh để chạm xem nghĩa. */
+function splitSubtitleIntoTouchableParts(text) {
+  const s = String(text ?? '');
+  const parts = [];
+  const re = /(\s+)|([A-Za-z]+(?:'[A-Za-z]+)?)/g;
+  let m;
+  let last = 0;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > last) {
+      parts.push({type: 'text', value: s.slice(last, m.index)});
+    }
+    if (m[1]) {
+      parts.push({type: 'text', value: m[1]});
+    } else if (m[2]) {
+      parts.push({type: 'word', value: m[2]});
+    }
+    last = re.lastIndex;
+  }
+  if (last < s.length) {
+    parts.push({type: 'text', value: s.slice(last)});
+  }
+  return parts;
+}
+
 function parseSubTime(str) {
   const parts = String(str || '')
     .trim()
@@ -246,8 +322,10 @@ function posLabel(word) {
 const VideoLearningScreen = ({route, navigation}) => {
   const {video} = route.params || {};
   const videoRef = useRef(null);
+  const translateRequestRef = useRef(0);
   const seekBarWidth = useRef(1);
   const currentTimeRef = useRef(0);
+  const lastProgressUiUpdateRef = useRef(0);
   const insets = useSafeAreaInsets();
 
   const [paused, setPaused] = useState(true);
@@ -258,11 +336,13 @@ const VideoLearningScreen = ({route, navigation}) => {
   const [muted, setMuted] = useState(false);
   const [rateIndex, setRateIndex] = useState(1);
   const [showControls, setShowControls] = useState(true);
-  const [ccEnabled, setCcEnabled] = useState(false);
+  const [ccEnabled, setCcEnabled] = useState(true);
+  /** Sau khi đã bấm play ít nhất một lần: cho phép hiện phụ đề khi tạm dừng giữa chừng. */
+  const [playbackEverStarted, setPlaybackEverStarted] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showVideoDoneModal, setShowVideoDoneModal] = useState(false);
   const [showNextActionModal, setShowNextActionModal] = useState(false);
-  const [nextActionTitle, setNextActionTitle] = useState('Hoàn thành video');
+  const [videoComprehension, setVideoComprehension] = useState(null);
   /** id từ video -> đã biết (gồm cả trùng từ chủ đề đã học) */
   const [learnedMap, setLearnedMap] = useState({});
   const learnedMapRef = useRef(learnedMap);
@@ -290,12 +370,32 @@ const VideoLearningScreen = ({route, navigation}) => {
   const subtitles = Array.isArray(video?.subtitles) ? video.subtitles : [];
   const hasSubtitles = subtitles.length > 0;
 
+  const videoStableKey = video?.id != null ? String(video.id) : playUrl;
+
+  useEffect(() => {
+    setPlaybackEverStarted(false);
+  }, [videoStableKey]);
+
+  useEffect(() => {
+    if (!paused) {
+      setPlaybackEverStarted(true);
+    }
+  }, [paused]);
+
   const videoWordsList = useMemo(() => {
     if (!video) {
       return [];
     }
     return getVideoWordsListForVideo(video);
   }, [video]);
+
+  const [tokenLookupTick, setTokenLookupTick] = useState(0);
+  const tokenLookup = useMemo(
+    () => buildVideoTokenMeaningLookup(video),
+    [video, tokenLookupTick],
+  );
+
+  const [wordPeek, setWordPeek] = useState(null);
 
   const refreshVideoWordsLearnedMap = useCallback(async () => {
     await loadVocabularyFromFirebase();
@@ -305,18 +405,26 @@ const VideoLearningScreen = ({route, navigation}) => {
 
   useFocusEffect(
     useCallback(() => {
+      if (video?.id != null) {
+        void saveContinueLearning({
+          kind: CONTINUE_KIND.VIDEO,
+          videoId: String(video.id),
+          videoTitle: String(video.title || '').slice(0, 160),
+        });
+      }
       let cancelled = false;
       void (async () => {
         await loadVocabularyFromFirebase();
         const m = await getVideoWordsLearnedMap(videoWordsList);
         if (!cancelled) {
           setLearnedMap(m);
+          setTokenLookupTick((x) => x + 1);
         }
       })();
       return () => {
         cancelled = true;
       };
-    }, [videoWordsList]),
+    }, [video?.id, video?.title, videoWordsList]),
   );
 
   useEffect(() => {
@@ -326,21 +434,94 @@ const VideoLearningScreen = ({route, navigation}) => {
     return () => sub.remove();
   }, [refreshVideoWordsLearnedMap]);
 
-  const currentCaption = useMemo(() => {
-    if (!ccEnabled || !hasSubtitles) {
-      return '';
+  const subtitleTimeline = useMemo(() => {
+    if (!hasSubtitles || !Array.isArray(subtitles)) {
+      return [];
     }
-    let line = '';
-    let bestT = -1;
-    for (const s of subtitles) {
-      const t = parseSubTime(s.time);
-      if (t <= currentTime && t >= bestT) {
-        bestT = t;
-        line = s.text;
+    return subtitles
+      .map((s) => ({
+        t: parseSubTime(s.time),
+        text: String(s.text || '').trim(),
+      }))
+      .filter((row) => row.text.length > 0)
+      .sort((a, b) => a.t - b.t);
+  }, [hasSubtitles, subtitles]);
+
+  const subtitlePlaybackSync = useMemo(() => {
+    if (!ccEnabled || subtitleTimeline.length === 0) {
+      return {lineText: '', activeTime: null};
+    }
+    const t = currentTime;
+    let lo = 0;
+    let hi = subtitleTimeline.length - 1;
+    let best = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (subtitleTimeline[mid].t <= t) {
+        best = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
       }
     }
-    return line;
-  }, [ccEnabled, hasSubtitles, subtitles, currentTime]);
+    if (best < 0) {
+      return {lineText: '', activeTime: null};
+    }
+    const row = subtitleTimeline[best];
+    return {lineText: row.text, activeTime: row.t};
+  }, [ccEnabled, subtitleTimeline, currentTime]);
+
+  const currentCaption = subtitlePlaybackSync.lineText;
+
+  const onSubtitleWordPress = useCallback(
+    (token, contextLine) => {
+      const hit = lookupVideoSubtitleToken(tokenLookup, token);
+      if (hit) {
+        setWordPeek({
+          display: hit.display,
+          meaning: hit.meaning,
+          id: hit.id,
+          source: hit.source,
+          contextLine: contextLine || '',
+          partOfSpeechVi: hit.partOfSpeechVi || '',
+          loadingTranslation: false,
+        });
+        return;
+      }
+      const disp = String(token || '').trim();
+      if (!disp) {
+        return;
+      }
+      const seq = ++translateRequestRef.current;
+      setWordPeek({
+        display: disp,
+        meaning: '',
+        id: null,
+        source: 'translate',
+        contextLine: contextLine || '',
+        partOfSpeechVi: '',
+        loadingTranslation: true,
+      });
+      void (async () => {
+        const vi = (await translateEnglishToVietnamese(disp)).trim();
+        if (translateRequestRef.current !== seq) {
+          return;
+        }
+        setWordPeek({
+          display: disp,
+          meaning:
+            vi ||
+            'Chưa dịch được. Kiểm tra mạng hoặc thử lại sau.',
+          id: null,
+          source: 'translate',
+          contextLine: contextLine || '',
+          partOfSpeechVi: '',
+          loadingTranslation: false,
+        });
+      })();
+    },
+    [tokenLookup],
+  );
 
   const playbackRate = RATES[rateIndex];
 
@@ -393,7 +574,7 @@ const VideoLearningScreen = ({route, navigation}) => {
     return () => sub.remove();
   }, [isFullscreen]);
 
-  const handleVideoLoad = (data) => {
+  const handleVideoLoad = useCallback((data) => {
     setIsLoading(false);
     if (data?.duration && Number.isFinite(data.duration)) {
       setDuration(data.duration);
@@ -402,7 +583,27 @@ const VideoLearningScreen = ({route, navigation}) => {
     if (t > 0.05) {
       videoRef.current?.seek(t);
     }
-  };
+  }, []);
+
+  const handleVideoProgress = useCallback(({currentTime: ct}) => {
+    const next = Number(ct) || 0;
+    currentTimeRef.current = next;
+    const now = Date.now();
+    // Hạn chế setState quá dày gây nhấp nháy trên một số máy Android.
+    if (now - lastProgressUiUpdateRef.current < 320) {
+      return;
+    }
+    lastProgressUiUpdateRef.current = now;
+    setCurrentTime((prev) => (Math.abs(prev - next) < 0.15 ? prev : next));
+  }, []);
+
+  const handleVideoError = useCallback((error) => {
+    if (__DEV__) {
+      console.warn('[Video playback]', friendlyPlaybackError(error));
+    }
+    setPlaybackError(friendlyPlaybackError(error));
+    setIsLoading(false);
+  }, []);
 
   const toggleWordLearned = useCallback(async (w) => {
     if (w?.id == null) return;
@@ -418,21 +619,21 @@ const VideoLearningScreen = ({route, navigation}) => {
     }
   }, [video?.id]);
 
+  const markVideoWatchedNow = useCallback(() => {
+    if (video?.id != null) {
+      void completeVideoAndAwardXP(video.id, XP.VIDEO_WATCH_COMPLETE);
+    }
+  }, [video?.id]);
+
   const handleVideoEnd = useCallback(() => {
     setPaused(true);
     setShowControls(true);
-    if (video?.id != null) {
-      void addVideoWatched(video.id);
-      void awardXPIfFirst(
-        `video_watch_complete_${String(video.id)}`,
-        XP.VIDEO_WATCH_COMPLETE,
-      );
-    }
+    markVideoWatchedNow();
     if (!videoWordsList.length) {
       return;
     }
     setShowVideoDoneModal(true);
-  }, [video?.id, videoWordsList]);
+  }, [markVideoWatchedNow, videoWordsList]);
 
   const handleBack = () => {
     navigation.goBack();
@@ -471,7 +672,7 @@ const VideoLearningScreen = ({route, navigation}) => {
     [navigation],
   );
 
-  const openVideoStudyModeSelection = useCallback(() => {
+  const openVideoPracticeLikeTopic = useCallback(() => {
     if (!videoWordsList.length) {
       Alert.alert(
         'Chưa có từ để luyện',
@@ -485,7 +686,7 @@ const VideoLearningScreen = ({route, navigation}) => {
         XP.VIDEO_PRACTICE_START,
       );
     }
-    navigateToVocabularyTab('VideoVocabularyStudyMode', {
+    navigateToVocabularyTab('VocabularyTopicDetail', {
       ...vocabNavParams,
       topicName: `Từ vựng video: ${String(video?.title || '').trim() || 'Video'}`,
     });
@@ -499,6 +700,8 @@ const VideoLearningScreen = ({route, navigation}) => {
 
   const goToHomeTab = useCallback(() => {
     const parent = navigation.getParent?.();
+    // Reset stack Video trước khi đổi tab để lần sau vào Video luôn về danh sách.
+    navigation.popToTop();
     if (parent) {
       parent.navigate('HomeTab');
       return;
@@ -506,30 +709,26 @@ const VideoLearningScreen = ({route, navigation}) => {
     navigation.goBack();
   }, [navigation]);
 
-  const openNextActionModal = useCallback((title) => {
-    setNextActionTitle(title);
-    setShowNextActionModal(true);
-  }, []);
-
   const handleVideoNotUnderstood = useCallback(() => {
     setShowVideoDoneModal(false);
-    openNextActionModal('Bạn chưa hiểu hết video');
+    setVideoComprehension('not_understood');
+    setShowNextActionModal(true);
     void (async () => {
       if (video?.id != null) {
         await setVideoNeedsPractice(video.id, true);
       }
     })();
-  }, [openNextActionModal, video?.id]);
+  }, [video?.id]);
 
   const handleVideoUnderstood = useCallback(() => {
     setShowVideoDoneModal(false);
-    openNextActionModal('Tuyệt vời! Bạn đã hiểu video');
+    setVideoComprehension('understood');
+    setShowNextActionModal(true);
     void (async () => {
       try {
-        for (const w of videoWordsList) {
-          if (w?.id != null) {
-            await markWordAsLearned(w.id, true);
-          }
+        const batchIds = videoWordsList.map((w) => w?.id).filter((id) => id != null);
+        if (batchIds.length) {
+          await markWordsLearnedBatch(batchIds, true);
         }
         if (video?.id != null) {
           await setVideoNeedsPractice(video.id, false);
@@ -560,6 +759,7 @@ const VideoLearningScreen = ({route, navigation}) => {
         return;
       }
       videoRef.current?.seek(sec);
+      lastProgressUiUpdateRef.current = Date.now();
       setCurrentTime(sec);
       setPaused(false);
       setShowControls(true);
@@ -580,6 +780,7 @@ const VideoLearningScreen = ({route, navigation}) => {
       if (d > 0) {
         const t = ratio * d;
         videoRef.current?.seek(t);
+        lastProgressUiUpdateRef.current = Date.now();
         setCurrentTime(t);
       }
     },
@@ -613,28 +814,56 @@ const VideoLearningScreen = ({route, navigation}) => {
   function renderMp4Player(fullscreen) {
     const outerStyle = fullscreen ? styles.videoOuterFullscreen : styles.videoOuter;
     const videoStyle = fullscreen ? styles.videoFullscreen : styles.video;
+    const renderCaptionOverlay = () => {
+      if (
+        !currentCaption ||
+        !ccEnabled ||
+        (paused && !playbackEverStarted)
+      ) {
+        return null;
+      }
+      const line = currentCaption;
+      const parts = splitSubtitleIntoTouchableParts(line);
+      return (
+        <View
+          style={[
+            styles.captionWrap,
+            styles.captionWrapElevated,
+          ]}
+          pointerEvents="box-none">
+          <View style={styles.captionBubble} pointerEvents="auto">
+            {parts.map((p, i) =>
+              p.type === 'word' ? (
+                <Pressable
+                  key={`cw-${i}`}
+                  style={styles.captionWordHit}
+                  onPress={() => onSubtitleWordPress(p.value, line)}
+                  hitSlop={{top: 6, bottom: 6, left: 3, right: 3}}>
+                  <Text style={styles.captionWordText}>{p.value}</Text>
+                </Pressable>
+              ) : (
+                <Text key={`ct-${i}`} style={styles.captionPlainText}>
+                  {p.value}
+                </Text>
+              ),
+            )}
+          </View>
+        </View>
+      );
+    };
     return (
       <View style={outerStyle}>
-        <Video
+        <Mp4VideoSurface
           ref={videoRef}
           source={mp4Source}
           style={videoStyle}
-          controls={false}
           paused={paused}
           muted={muted}
           rate={playbackRate}
-          resizeMode="contain"
-          progressUpdateInterval={250}
           onLoad={handleVideoLoad}
-          onProgress={({currentTime: ct}) => setCurrentTime(ct)}
+          onProgress={handleVideoProgress}
           onEnd={handleVideoEnd}
-          onError={(error) => {
-            if (__DEV__) {
-              console.warn('[Video playback]', friendlyPlaybackError(error));
-            }
-            setPlaybackError(friendlyPlaybackError(error));
-            setIsLoading(false);
-          }}
+          onError={handleVideoError}
         />
         {isLoading && (
           <View style={styles.loadingOverlay}>
@@ -645,11 +874,6 @@ const VideoLearningScreen = ({route, navigation}) => {
         {playbackError ? (
           <View style={styles.errorBannerOnVideo}>
             <Text style={styles.errorBannerText}>{playbackError}</Text>
-          </View>
-        ) : null}
-        {currentCaption ? (
-          <View style={styles.captionWrap} pointerEvents="none">
-            <Text style={styles.captionText}>{currentCaption}</Text>
           </View>
         ) : null}
         {showCenterPlay ? (
@@ -669,8 +893,9 @@ const VideoLearningScreen = ({route, navigation}) => {
             onPress={() => setShowControls((v) => !v)}
           />
         )}
+        {renderCaptionOverlay()}
         {showBottomBar ? (
-          <View style={styles.controlsBar} pointerEvents="box-none">
+          <View style={[styles.controlsBar, styles.controlsBarElevated]} pointerEvents="box-none">
             <View style={styles.timeRow}>
               <Text style={styles.timeText}>{formatTime(currentTime)}</Text>
               <Text style={styles.timeText}>{endTimeLabel}</Text>
@@ -748,13 +973,20 @@ const VideoLearningScreen = ({route, navigation}) => {
 
   return (
     <>
+    <StatusBar
+      barStyle="light-content"
+      backgroundColor={COLORS.PRIMARY_DARK}
+      translucent={Platform.OS === 'android'}
+    />
     <SafeAreaView style={styles.container}>
       <View style={[styles.header, {paddingTop: headerTopPad}]}>
         <TouchableOpacity
           style={styles.headerBack}
           onPress={handleBack}
-          hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}>
-          <Feather name="chevron-left" size={26} color={COLORS.TEXT} />
+          hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
+          accessibilityRole="button"
+          accessibilityLabel="Quay lại">
+          <Feather name="chevron-left" size={26} color="#FFFFFF" />
         </TouchableOpacity>
         <View style={styles.headerBody}>
           <Text style={styles.headerTitle} numberOfLines={2}>
@@ -802,12 +1034,6 @@ const VideoLearningScreen = ({route, navigation}) => {
                 Link YouTube chưa hợp lệ. Vui lòng kiểm tra lại URL video.
               </Text>
             )}
-            <TouchableOpacity
-              style={styles.markDoneBtn}
-              onPress={handleVideoEnd}
-              activeOpacity={0.85}>
-              <Text style={styles.markDoneBtnText}>Tôi đã xem xong</Text>
-            </TouchableOpacity>
           </View>
         ) : isFullscreen ? (
           <TouchableOpacity
@@ -824,7 +1050,6 @@ const VideoLearningScreen = ({route, navigation}) => {
         )}
       </View>
       </View>
-
       <ScrollView
         style={styles.tabScroll}
         contentContainerStyle={styles.tabScrollContent}
@@ -833,37 +1058,77 @@ const VideoLearningScreen = ({route, navigation}) => {
             {hasSubtitles ? (
               <View style={styles.transcriptBlock}>
                 <View style={styles.sectionHeadRow}>
-                  <Text style={styles.sectionTitle}>Phụ đề / script</Text>
-                  <Text style={styles.transcriptHint}>
-                    {isYoutube
-                      ? 'Chạm dòng → mở YouTube đúng mốc'
-                      : 'Chạm dòng để tua video'}
-                  </Text>
+                  <View style={styles.sectionTitleWithIcon}>
+                    <View style={styles.sectionIconBubble}>
+                      <Feather name="align-left" size={15} color={COLORS.PRIMARY_DARK} />
+                    </View>
+                    <Text style={styles.sectionTitle}>Phụ đề / script</Text>
+                  </View>
                 </View>
-                {subtitles.map((line, idx) => (
-                  <TouchableOpacity
-                    key={`sub-${idx}-${String(line?.time ?? '')}`}
-                    style={styles.transcriptRow}
-                    onPress={() => seekToSubtitleTime(line?.time)}
-                    activeOpacity={0.7}>
-                    <Text style={styles.transcriptTime}>{String(line?.time ?? '').trim()}</Text>
-                    <Text style={styles.transcriptText}>{String(line?.text ?? '').trim()}</Text>
-                    {isYoutube ? (
-                      <Feather
-                        name="external-link"
-                        size={16}
-                        color={COLORS.TEXT_LIGHT}
-                        style={styles.transcriptLinkIcon}
-                      />
-                    ) : null}
-                  </TouchableOpacity>
-                ))}
+                {subtitles.map((line, idx) => {
+                  const lineText = String(line?.text ?? '').trim();
+                  const lineT = parseSubTime(line?.time);
+                  const isSubActive =
+                    subtitlePlaybackSync.activeTime != null &&
+                    Math.abs(lineT - subtitlePlaybackSync.activeTime) < 0.05;
+                  const parts = splitSubtitleIntoTouchableParts(lineText);
+                  return (
+                    <View
+                      key={`sub-${idx}-${String(line?.time ?? '')}`}
+                      style={[
+                        styles.transcriptRow,
+                        isSubActive && styles.transcriptRowActive,
+                      ]}>
+                      <TouchableOpacity
+                        style={styles.transcriptSeekHit}
+                        onPress={() => seekToSubtitleTime(line?.time)}
+                        activeOpacity={0.65}
+                        hitSlop={{top: 4, bottom: 4}}>
+                        <Text style={styles.transcriptTime}>{String(line?.time ?? '').trim()}</Text>
+                      </TouchableOpacity>
+                      <View style={styles.transcriptTextWrap}>
+                        {parts.map((p, j) =>
+                          p.type === 'word' ? (
+                            <Pressable
+                              key={`tw-${idx}-${j}`}
+                              style={styles.transcriptWordHit}
+                              onPress={() => onSubtitleWordPress(p.value, lineText)}
+                              hitSlop={2}>
+                              <Text style={styles.transcriptWordText}>{p.value}</Text>
+                            </Pressable>
+                          ) : (
+                            <Text key={`tt-${idx}-${j}`} style={styles.transcriptTextPlain}>
+                              {p.value}
+                            </Text>
+                          ),
+                        )}
+                      </View>
+                      {isYoutube ? (
+                        <TouchableOpacity
+                          onPress={() => seekToSubtitleTime(line?.time)}
+                          hitSlop={8}
+                          style={styles.transcriptLinkIcon}>
+                          <Feather
+                            name="external-link"
+                            size={16}
+                            color={COLORS.TEXT_LIGHT}
+                          />
+                        </TouchableOpacity>
+                      ) : null}
+                    </View>
+                  );
+                })}
               </View>
             ) : null}
 
             <View style={styles.videoWordsSectionHead}>
               <View style={[styles.sectionHeadRow, styles.sectionHeadRowDense]}>
-                <Text style={styles.sectionTitle}>Từ vựng trong video</Text>
+                <View style={styles.sectionTitleWithIcon}>
+                  <View style={styles.sectionIconBubble}>
+                    <Feather name="book-open" size={15} color={COLORS.PRIMARY_DARK} />
+                  </View>
+                  <Text style={styles.sectionTitle}>Từ vựng trong video</Text>
+                </View>
                 <View style={styles.countBadge}>
                   <Text style={styles.countBadgeText}>
                     {videoWordsList.length} từ
@@ -937,6 +1202,77 @@ const VideoLearningScreen = ({route, navigation}) => {
       </ScrollView>
     </SafeAreaView>
 
+    <Modal
+      visible={wordPeek != null}
+      transparent
+      animationType="fade"
+      onRequestClose={() => setWordPeek(null)}>
+      <View style={[styles.wordPeekRoot, {paddingBottom: Math.max(24, insets.bottom + 12)}]}>
+        <Pressable
+          style={StyleSheet.absoluteFill}
+          onPress={() => setWordPeek(null)}
+          accessibilityRole="button"
+          accessibilityLabel="Đóng"
+        />
+        <View style={styles.wordPeekCard}>
+          <Text style={styles.wordPeekEn}>{wordPeek?.display}</Text>
+          {String(wordPeek?.partOfSpeechVi || '').trim() ? (
+            <Text style={styles.wordPeekPos}>{wordPeek.partOfSpeechVi}</Text>
+          ) : null}
+          {wordPeek?.loadingTranslation ? (
+            <View style={styles.wordPeekTranslating}>
+              <ActivityIndicator size="small" color={COLORS.PRIMARY} />
+              <Text style={styles.wordPeekTranslatingText}>Đang dịch…</Text>
+            </View>
+          ) : (
+            <>
+              <Text style={styles.wordPeekVi}>{wordPeek?.meaning}</Text>
+              {wordPeek?.source === 'translate' &&
+              String(wordPeek?.meaning || '').trim() ? (
+                <Text style={styles.wordPeekAutoNote}>Bản dịch tự động (EN → VI)</Text>
+              ) : null}
+            </>
+          )}
+          {String(wordPeek?.contextLine || '').trim() ? (
+            <Text style={styles.wordPeekContext} numberOfLines={5}>
+              Ngữ cảnh: {wordPeek.contextLine}
+            </Text>
+          ) : null}
+          {wordPeek?.id != null ? (
+            <TouchableOpacity
+              style={styles.wordPeekLearnBtn}
+              onPress={() => {
+                void toggleWordLearned({
+                  id: wordPeek.id,
+                  word: wordPeek.display,
+                });
+                setWordPeek(null);
+              }}
+              activeOpacity={0.88}>
+              <Feather
+                name={
+                  learnedMap[String(wordPeek.id)] === true ? 'rotate-ccw' : 'check-circle'
+                }
+                size={18}
+                color="#FFF"
+              />
+              <Text style={styles.wordPeekLearnBtnText}>
+                {learnedMap[String(wordPeek.id)] === true
+                  ? 'Bỏ đánh dấu đã biết'
+                  : 'Đánh dấu đã biết'}
+              </Text>
+            </TouchableOpacity>
+          ) : null}
+          <TouchableOpacity
+            style={styles.wordPeekClose}
+            onPress={() => setWordPeek(null)}
+            hitSlop={8}>
+            <Text style={styles.wordPeekCloseText}>Đóng</Text>
+          </TouchableOpacity>
+        </View>
+      </View>
+    </Modal>
+
     {!isYoutube && playUrl ? (
       <Modal
         visible={isFullscreen}
@@ -972,10 +1308,10 @@ const VideoLearningScreen = ({route, navigation}) => {
     <Modal
       visible={showVideoDoneModal}
       transparent
-      animationType="fade"
+      animationType="slide"
       onRequestClose={() => setShowVideoDoneModal(false)}>
       <View style={styles.promptOverlay}>
-        <View style={styles.promptCard}>
+        <View style={[styles.promptCard, styles.bottomSheetCard]}>
           <View style={styles.promptIconWrap}>
             <Feather name="help-circle" size={22} color={COLORS.PRIMARY_DARK} />
           </View>
@@ -1008,25 +1344,42 @@ const VideoLearningScreen = ({route, navigation}) => {
     <Modal
       visible={showNextActionModal}
       transparent
-      animationType="fade"
+      animationType="slide"
       onRequestClose={() => setShowNextActionModal(false)}>
       <View style={styles.promptOverlay}>
-        <View style={styles.promptCard}>
+        <View style={[styles.promptCard, styles.bottomSheetCard]}>
           <View style={styles.promptIconWrap}>
             <Feather name="book-open" size={22} color={COLORS.PRIMARY_DARK} />
           </View>
-          <Text style={styles.promptTitle}>{nextActionTitle}</Text>
-          <Text style={styles.promptMessage}>Bạn muốn làm gì tiếp theo?</Text>
+          <Text style={styles.promptTitle}>
+            {videoComprehension === 'understood'
+              ? 'Tuyệt vời! Bạn đã hiểu video'
+              : 'Bạn chưa hiểu hết video'}
+          </Text>
+          <Text style={styles.promptMessage}>
+            Tổng kết XP cho video này:
+          </Text>
+          <View style={styles.xpSummaryCard}>
+            <View style={styles.xpSummaryRow}>
+              <Text style={styles.xpSummaryLabel}>Hoàn thành video</Text>
+              <Text style={styles.xpSummaryValue}>+{XP.VIDEO_WATCH_COMPLETE} XP</Text>
+            </View>
+            <View style={styles.xpSummaryRow}>
+              <Text style={styles.xpSummaryLabel}>Bắt đầu luyện tập từ video</Text>
+              <Text style={styles.xpSummaryValue}>+{XP.VIDEO_PRACTICE_START} XP</Text>
+            </View>
+          </View>
+          <Text style={styles.promptMessage}>Bạn có muốn luyện tập từ vựng của video này không?</Text>
           <View style={styles.promptBtnCol}>
             <TouchableOpacity
               style={[styles.promptBtnWide, styles.promptBtnPrimary]}
               onPress={() => {
                 setShowNextActionModal(false);
-                openVideoStudyModeSelection();
+                openVideoPracticeLikeTopic();
               }}
               activeOpacity={0.9}>
               <Text style={[styles.promptBtnText, styles.promptBtnPrimaryText]}>
-                Học từ mới
+                Có, luyện tập ngay
               </Text>
             </TouchableOpacity>
             <TouchableOpacity
@@ -1037,7 +1390,7 @@ const VideoLearningScreen = ({route, navigation}) => {
               }}
               activeOpacity={0.9}>
               <Text style={[styles.promptBtnText, styles.promptBtnGhostText]}>
-                Quay lại trang chủ
+                Để sau
               </Text>
             </TouchableOpacity>
           </View>
@@ -1059,38 +1412,49 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 10,
     paddingBottom: 14,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
+    backgroundColor: COLORS.PRIMARY,
     borderBottomWidth: 0,
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: 3},
+    shadowOpacity: 0.12,
+    shadowRadius: 8,
+    elevation: 4,
   },
   headerBack: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#F3F4F6',
+    backgroundColor: 'rgba(255,255,255,0.22)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.35)',
   },
   headerBody: {
     flex: 1,
-    marginLeft: 8,
+    marginLeft: 10,
+    paddingRight: 8,
   },
   headerTitle: {
-    fontSize: 19,
+    fontSize: 17,
     fontWeight: '800',
-    color: COLORS.TEXT,
-    lineHeight: 23,
+    color: '#FFFFFF',
+    lineHeight: 22,
+    letterSpacing: -0.2,
   },
   videoCard: {
-    marginHorizontal: 12,
-    marginTop: 10,
-    borderRadius: 14,
+    marginHorizontal: 14,
+    marginTop: 12,
+    borderRadius: 18,
     overflow: 'hidden',
-    backgroundColor: '#0F0F0F',
-    shadowColor: '#000',
-    shadowOffset: {width: 0, height: 2},
-    shadowOpacity: 0.18,
-    shadowRadius: 6,
-    elevation: 4,
+    backgroundColor: '#0B1220',
+    borderWidth: 1,
+    borderColor: '#1E293B',
+    shadowColor: '#0F172A',
+    shadowOffset: {width: 0, height: 6},
+    shadowOpacity: 0.2,
+    shadowRadius: 16,
+    elevation: 8,
   },
   videoOuter: {
     width: VIDEO_WIDTH,
@@ -1184,10 +1548,42 @@ const styles = StyleSheet.create({
   },
   captionWrap: {
     position: 'absolute',
-    bottom: 100,
+    bottom: 92,
     left: 16,
     right: 16,
     alignItems: 'center',
+  },
+  captionWrapElevated: {
+    zIndex: 4,
+  },
+  captionBubble: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.74)',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 10,
+    maxWidth: '90%',
+  },
+  captionWordHit: {
+    marginHorizontal: 1,
+    marginVertical: 1,
+  },
+  captionWordText: {
+    color: '#FFF',
+    fontSize: 16,
+    lineHeight: 23,
+    fontWeight: '700',
+    textDecorationLine: 'underline',
+    textDecorationColor: 'rgba(253,186,116,0.95)',
+  },
+  captionPlainText: {
+    color: '#FFF',
+    fontSize: 16,
+    lineHeight: 23,
+    fontWeight: '500',
   },
   captionText: {
     backgroundColor: 'rgba(0,0,0,0.72)',
@@ -1232,7 +1628,12 @@ const styles = StyleSheet.create({
     paddingHorizontal: 12,
     paddingBottom: 12,
     paddingTop: 10,
-    backgroundColor: 'rgba(0,0,0,0.58)',
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255,255,255,0.12)',
+    backgroundColor: 'rgba(2,6,23,0.72)',
+  },
+  controlsBarElevated: {
+    zIndex: 6,
   },
   timeRow: {
     flexDirection: 'row',
@@ -1322,15 +1723,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
   },
-  markDoneBtn: {
-    paddingVertical: 10,
-    paddingHorizontal: 16,
-  },
-  markDoneBtnText: {
-    color: COLORS.PRIMARY_LIGHT,
-    fontSize: 15,
-    fontWeight: '600',
-  },
   errorContainer: {
     flex: 1,
     justifyContent: 'center',
@@ -1352,31 +1744,38 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   tabScrollContent: {
-    paddingHorizontal: 16,
-    paddingTop: 12,
-    paddingBottom: 28,
+    paddingHorizontal: 14,
+    paddingTop: 14,
+    paddingBottom: 32,
   },
   transcriptBlock: {
-    marginBottom: 20,
-  },
-  transcriptHint: {
-    fontSize: 11,
-    fontWeight: '600',
-    color: COLORS.TEXT_SECONDARY,
-    maxWidth: '48%',
-    textAlign: 'right',
+    marginBottom: 22,
   },
   transcriptRow: {
     flexDirection: 'row',
     alignItems: 'flex-start',
     gap: 10,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    marginBottom: 6,
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+    marginBottom: 8,
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 10,
+    borderRadius: 14,
     borderWidth: 1,
-    borderColor: COLORS.BORDER,
+    borderColor: '#EEF2F7',
+    shadowColor: '#0F172A',
+    shadowOffset: {width: 0, height: 2},
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 2,
+  },
+  transcriptRowActive: {
+    borderColor: COLORS.PRIMARY,
+    backgroundColor: COLORS.PRIMARY_SOFT,
+    shadowOpacity: 0.08,
+  },
+  transcriptSeekHit: {
+    minWidth: 48,
+    paddingVertical: 2,
   },
   transcriptTime: {
     fontSize: 12,
@@ -1384,6 +1783,29 @@ const styles = StyleSheet.create({
     color: COLORS.PRIMARY,
     fontVariant: ['tabular-nums'],
     minWidth: 48,
+  },
+  transcriptTextWrap: {
+    flex: 1,
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    alignItems: 'center',
+  },
+  transcriptWordHit: {
+    marginRight: 2,
+    marginBottom: 2,
+  },
+  transcriptWordText: {
+    fontSize: 14,
+    color: COLORS.PRIMARY,
+    lineHeight: 20,
+    fontWeight: '700',
+    textDecorationLine: 'underline',
+    textDecorationColor: 'rgba(124,58,237,0.45)',
+  },
+  transcriptTextPlain: {
+    fontSize: 14,
+    color: COLORS.TEXT,
+    lineHeight: 20,
   },
   transcriptText: {
     flex: 1,
@@ -1394,6 +1816,90 @@ const styles = StyleSheet.create({
   transcriptLinkIcon: {
     marginTop: 2,
     alignSelf: 'flex-start',
+    padding: 4,
+  },
+  wordPeekRoot: {
+    flex: 1,
+    justifyContent: 'flex-end',
+    backgroundColor: 'rgba(0,0,0,0.45)',
+    paddingHorizontal: 16,
+  },
+  wordPeekCard: {
+    backgroundColor: COLORS.BACKGROUND_WHITE,
+    borderRadius: 20,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#EEF2F7',
+    shadowColor: '#000',
+    shadowOffset: {width: 0, height: -4},
+    shadowOpacity: 0.12,
+    shadowRadius: 24,
+    elevation: 12,
+  },
+  wordPeekEn: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: COLORS.TEXT,
+  },
+  wordPeekPos: {
+    marginTop: 4,
+    fontSize: 12,
+    fontWeight: '600',
+    color: COLORS.TEXT_SECONDARY,
+  },
+  wordPeekVi: {
+    marginTop: 10,
+    fontSize: 16,
+    lineHeight: 24,
+    color: COLORS.TEXT,
+  },
+  wordPeekTranslating: {
+    marginTop: 14,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+  },
+  wordPeekTranslatingText: {
+    fontSize: 15,
+    color: COLORS.TEXT_SECONDARY,
+    fontWeight: '600',
+  },
+  wordPeekAutoNote: {
+    marginTop: 8,
+    fontSize: 12,
+    color: COLORS.TEXT_SECONDARY,
+  },
+  wordPeekContext: {
+    marginTop: 12,
+    fontSize: 14,
+    lineHeight: 21,
+    color: COLORS.TEXT_SECONDARY,
+    fontStyle: 'italic',
+  },
+  wordPeekLearnBtn: {
+    marginTop: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    backgroundColor: COLORS.PRIMARY,
+    paddingVertical: 12,
+    borderRadius: 12,
+  },
+  wordPeekLearnBtnText: {
+    color: '#FFF',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  wordPeekClose: {
+    marginTop: 12,
+    alignItems: 'center',
+    paddingVertical: 8,
+  },
+  wordPeekCloseText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: COLORS.PRIMARY,
   },
   sectionHead: {
     marginBottom: 14,
@@ -1414,35 +1920,57 @@ const styles = StyleSheet.create({
     marginBottom: 14,
     marginTop: 4,
   },
+  sectionTitleWithIcon: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    flex: 1,
+    minWidth: 0,
+    marginRight: 8,
+  },
+  sectionIconBubble: {
+    width: 34,
+    height: 34,
+    borderRadius: 12,
+    backgroundColor: COLORS.PRIMARY_SOFT,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(255,123,0,0.2)',
+  },
   sectionTitle: {
     fontSize: 17,
-    fontWeight: '700',
+    fontWeight: '800',
     color: COLORS.TEXT,
+    letterSpacing: -0.3,
+    flexShrink: 1,
   },
   countBadge: {
     backgroundColor: COLORS.PRIMARY_SOFT,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 8,
+    paddingHorizontal: 11,
+    paddingVertical: 6,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: 'rgba(255,123,0,0.22)',
   },
   countBadgeText: {
-    fontSize: 13,
-    fontWeight: '700',
+    fontSize: 12,
+    fontWeight: '800',
     color: COLORS.PRIMARY_DARK,
   },
   wordCard: {
     backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 12,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    marginBottom: 8,
+    borderRadius: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    marginBottom: 10,
     borderWidth: 1,
-    borderColor: COLORS.BORDER,
-    shadowColor: '#000',
-    shadowOffset: {width: 0, height: 1},
-    shadowOpacity: 0.04,
-    shadowRadius: 3,
-    elevation: 1,
+    borderColor: '#EEF2F7',
+    shadowColor: '#0F172A',
+    shadowOffset: {width: 0, height: 3},
+    shadowOpacity: 0.06,
+    shadowRadius: 10,
+    elevation: 2,
   },
   wordTopRow: {
     flexDirection: 'row',
@@ -1533,17 +2061,24 @@ const styles = StyleSheet.create({
   promptOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.35)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    paddingHorizontal: 20,
+    justifyContent: 'flex-end',
+    paddingHorizontal: 10,
+    paddingBottom: 10,
   },
   promptCard: {
     width: '100%',
-    maxWidth: 360,
     backgroundColor: COLORS.BACKGROUND_WHITE,
     borderRadius: 18,
     paddingHorizontal: 16,
     paddingVertical: 18,
+  },
+  bottomSheetCard: {
+    borderTopLeftRadius: 20,
+    borderTopRightRadius: 20,
+    borderBottomLeftRadius: 16,
+    borderBottomRightRadius: 16,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
   },
   promptIconWrap: {
     width: 42,
@@ -1576,6 +2111,38 @@ const styles = StyleSheet.create({
   promptBtnCol: {
     gap: 10,
     marginTop: 16,
+  },
+  xpSummaryCard: {
+    marginTop: 10,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#E5E7EB',
+    backgroundColor: '#F9FAFB',
+    padding: 10,
+    gap: 6,
+  },
+  xpSummaryRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  xpSummaryLabel: {
+    flex: 1,
+    fontSize: 13,
+    color: COLORS.TEXT_SECONDARY,
+    fontWeight: '600',
+  },
+  xpSummaryValue: {
+    fontSize: 13,
+    color: '#15803D',
+    fontWeight: '800',
+  },
+  xpSummaryHint: {
+    marginTop: 2,
+    fontSize: 12,
+    color: '#6B7280',
+    lineHeight: 17,
   },
   promptBtn: {
     flex: 1,

@@ -1,11 +1,12 @@
 import React, {useEffect, useState} from 'react';
-import {ActivityIndicator, View} from 'react-native';
+import {ActivityIndicator, Alert, View} from 'react-native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import {TabBarVectorIcon} from '../components/TabBarVectorIcons';
 import {NavigationContainer, getFocusedRouteNameFromRoute} from '@react-navigation/native';
 import {createNativeStackNavigator} from '@react-navigation/native-stack';
 import {createBottomTabNavigator} from '@react-navigation/bottom-tabs';
-import auth from '@react-native-firebase/auth';
+import {getApp} from '@react-native-firebase/app';
+import {getAuth, onIdTokenChanged} from '@react-native-firebase/auth';
 import {
   HomeScreen,
   ProfileScreen,
@@ -20,24 +21,24 @@ import {
   VocabularyTypingScreen,
   VocabularyListeningScreen,
   VocabularyQuickChallengeScreen,
-  VideoVocabularyStudyModeScreen,
+  VocabularyTopicDetailScreen,
   VideoSelectionScreen,
   VideoLearningScreen,
   DialogueIntroScreen,
   DialoguePracticeScreen,
-  LessonDetailScreen,
 } from '../screens';
-import AdminGate from '../screens/admin/AdminGate';
 import {COLORS} from '../constants';
 import {buildMainTabBarStyle} from './tabBarOptions';
-import {ensureFirestoreAuthReady} from '../services/firebaseService';
-import {loadVideosFromFirebase} from '../services/videoService';
-import {loadVocabularyFromFirebase} from '../services/vocabularyService';
-import {loadDialoguesFromFirebase} from '../services/dialogueService';
+import {preloadEssentialData} from '../services/appDataBootstrap';
+import {
+  enforceNotSuspendedOrSignOut,
+  SUSPENDED_SIGN_OUT_MESSAGE,
+} from '../services/firebaseService';
 
 const Stack = createNativeStackNavigator();
 const RootStack = createNativeStackNavigator();
 const Tab = createBottomTabNavigator();
+const authInstance = getAuth(getApp());
 
 const screenOptions = {
   headerStyle: {
@@ -65,7 +66,11 @@ const HomeStack = () => (
       component={ProfileScreen}
       options={{headerShown: false}}
     />
-    <Stack.Screen name="LearningPath" component={LearningPathScreen} options={{title: 'Hoạt động của tôi'}} />
+    <Stack.Screen
+      name="LearningPath"
+      component={LearningPathScreen}
+      options={{title: 'Bảng xếp hạng'}}
+    />
     <Stack.Screen
       name="LearnedVocabulary"
       component={LearnedVocabularyScreen}
@@ -88,8 +93,7 @@ const VocabularyStack = () => (
     <Stack.Screen name="VocabularyTyping" component={VocabularyTypingScreen} options={{title: 'Gõ từ', headerShown: false}} />
     <Stack.Screen name="VocabularyListening" component={VocabularyListeningScreen} options={{title: 'Nghe và chọn', headerShown: false}} />
     <Stack.Screen name="VocabularyQuickChallenge" component={VocabularyQuickChallengeScreen} options={{title: 'Thử thách 60 giây', headerShown: false}} />
-    <Stack.Screen name="VideoVocabularyStudyMode" component={VideoVocabularyStudyModeScreen} options={{title: 'Phương thức học', headerShown: false}} />
-    <Stack.Screen name="LessonDetail" component={LessonDetailScreen} options={{title: 'Chi tiết bài học'}} />
+    <Stack.Screen name="VocabularyTopicDetail" component={VocabularyTopicDetailScreen} options={{title: 'Chi tiết bộ từ', headerShown: false}} />
   </Stack.Navigator>
 );
 
@@ -119,27 +123,47 @@ const DialogueStack = () => (
 
 const tabScreenOptions = {
   headerShown: false,
-  tabBarActiveTintColor: COLORS.PRIMARY,
-  tabBarInactiveTintColor: COLORS.TEXT_LIGHT,
+  tabBarActiveTintColor: COLORS.PRIMARY_DARK,
+  tabBarInactiveTintColor: '#94A3B8',
   tabBarLabelStyle: {
     fontSize: 11,
-    fontWeight: '600',
+    fontWeight: '700',
+    letterSpacing: 0.15,
   },
 };
 
-/** Icon Feather + gạch chân tab đang chọn */
+/** Icon Feather + vòng nền và pill nhấn cho tab đang chọn */
 function TabBarIconWithIndicator({iconName, focused, color}) {
   return (
-    <View style={{alignItems: 'center', justifyContent: 'flex-start', minHeight: 44}}>
-      <TabBarVectorIcon name={iconName} color={color} size={26} />
-      <View style={{height: 5, marginTop: 2, alignItems: 'center'}}>
+    <View style={{alignItems: 'center', justifyContent: 'flex-start', minHeight: 46, width: 56}}>
+      <View
+        style={{
+          width: 46,
+          height: 46,
+          alignItems: 'center',
+          justifyContent: 'center',
+        }}>
         {focused ? (
           <View
             style={{
+              position: 'absolute',
               width: 40,
+              height: 40,
+              borderRadius: 20,
+              backgroundColor: 'rgba(255, 123, 0, 0.14)',
+            }}
+          />
+        ) : null}
+        <TabBarVectorIcon name={iconName} color={color} size={focused ? 24 : 23} />
+      </View>
+      <View style={{height: 5, marginTop: 2, alignItems: 'center', justifyContent: 'center'}}>
+        {focused ? (
+          <View
+            style={{
+              width: 26,
               height: 3,
-              backgroundColor: COLORS.TEXT,
-              borderRadius: 2,
+              borderRadius: 3,
+              backgroundColor: COLORS.PRIMARY,
             }}
           />
         ) : (
@@ -164,6 +188,16 @@ const MainTabs = () => {
     <Tab.Screen
       name="HomeTab"
       component={HomeStack}
+      listeners={({navigation, route}) => ({
+        tabPress: e => {
+          const state = route?.state;
+          if (state && typeof state.index === 'number' && state.index > 0) {
+            // Chặn chuyển tab mặc định (vào màn stack hiện tại) để tránh lóe LearningPath rồi mới về Home.
+            e.preventDefault();
+            navigation.navigate('HomeTab', {screen: 'Home'});
+          }
+        },
+      })}
       options={({route}) => {
         const routeName = getFocusedRouteNameFromRoute(route) ?? 'Home';
         const hideTabBar = routeName === 'LearnedVocabulary';
@@ -181,17 +215,24 @@ const MainTabs = () => {
     <Tab.Screen
       name="VocabularyTab"
       component={VocabularyStack}
+      listeners={({navigation, route}) => ({
+        tabPress: () => {
+          const state = route?.state;
+          if (state && typeof state.index === 'number' && state.index > 0) {
+            navigation.navigate('VocabularyTab', {screen: 'Vocabulary'});
+          }
+        },
+      })}
       options={({route}) => {
         const routeName = getFocusedRouteNameFromRoute(route) ?? 'Vocabulary';
         const hideTabBar =
-          routeName === 'VideoVocabularyStudyMode' ||
           routeName === 'VocabularyFlashcard' ||
           routeName === 'VocabularyQuiz' ||
           routeName === 'VocabularyTyping' ||
           routeName === 'VocabularyListening' ||
           routeName === 'VocabularyQuickChallenge' ||
-          routeName === 'FlashcardResult' ||
-          routeName === 'LessonDetail';
+          routeName === 'VocabularyTopicDetail' ||
+          routeName === 'FlashcardResult';
         return {
           title: 'Từ vựng',
           tabBarStyle: hideTabBar
@@ -206,6 +247,14 @@ const MainTabs = () => {
     <Tab.Screen
       name="VideoTab"
       component={VideoStack}
+      listeners={({navigation, route}) => ({
+        tabPress: () => {
+          const state = route?.state;
+          if (state && typeof state.index === 'number' && state.index > 0) {
+            navigation.navigate('VideoTab', {screen: 'VideoSelection'});
+          }
+        },
+      })}
       options={({route}) => {
         const routeName = getFocusedRouteNameFromRoute(route) ?? 'VideoSelection';
         const hideTabBar = routeName === 'VideoLearning';
@@ -223,16 +272,24 @@ const MainTabs = () => {
     <Tab.Screen
       name="DialogueTab"
       component={DialogueStack}
+      listeners={({navigation, route}) => ({
+        tabPress: () => {
+          const state = route?.state;
+          if (state && typeof state.index === 'number' && state.index > 0) {
+            navigation.navigate('DialogueTab', {screen: 'DialogueIntro'});
+          }
+        },
+      })}
       options={({route}) => {
         const routeName = getFocusedRouteNameFromRoute(route) ?? 'DialogueIntro';
         const hideTabBar = routeName === 'DialoguePractice';
         return {
-        title: 'Hội thoại',
-        tabBarStyle: hideTabBar ? {display: 'none'} : buildMainTabBarStyle(insets.bottom),
-        tabBarIcon: ({focused, color}) => (
-          <TabBarIconWithIndicator iconName="message-circle" focused={focused} color={color} />
-        ),
-      };
+          title: 'Hội thoại',
+          tabBarStyle: hideTabBar ? {display: 'none'} : buildMainTabBarStyle(insets.bottom),
+          tabBarIcon: ({focused, color}) => (
+            <TabBarIconWithIndicator iconName="message-circle" focused={focused} color={color} />
+          ),
+        };
       }}
     />
     <Tab.Screen
@@ -249,11 +306,10 @@ const MainTabs = () => {
   );
 };
 
-/** Tabs + Admin full màn hình (không bottom nav) */
+/** Root: chỉ chứa MainTabs dành cho học viên (không còn stack Admin). */
 const RootNavigator = () => (
   <RootStack.Navigator initialRouteName="Main" screenOptions={{headerShown: false}}>
     <RootStack.Screen name="Main" component={MainTabs} />
-    <RootStack.Screen name="Admin" component={AdminGate} />
   </RootStack.Navigator>
 );
 
@@ -266,33 +322,66 @@ const AuthStack = () => (
   </Stack.Navigator>
 );
 
+const AUTH_INIT_FALLBACK_MS = 12000;
+const SUSPENDED_CHECK_TIMEOUT_MS = 10000;
+
 const AppNavigator = () => {
   const [initializing, setInitializing] = useState(true);
   const [user, setUser] = useState(null);
   const [showMainTabs, setShowMainTabs] = useState(false);
 
   useEffect(() => {
+    const fallbackTimer = setTimeout(() => {
+      setInitializing(prev => {
+        if (!prev) return prev;
+        try {
+          setUser(authInstance.currentUser);
+        } catch (_) {}
+        return false;
+      });
+    }, AUTH_INIT_FALLBACK_MS);
     // onIdTokenChanged sẽ chạy cả khi user được "link" từ anonymous -> email/google,
     // giúp chuyển vào Home ngay mà không cần thoát app.
-    const unsubscribe = auth().onIdTokenChanged(current => {
+    const unsubscribe = onIdTokenChanged(authInstance, current => {
       setUser(current);
-      if (initializing) setInitializing(false);
+      setInitializing(false);
     });
-    return unsubscribe;
-  }, [initializing]);
+    return () => {
+      clearTimeout(fallbackTimer);
+      unsubscribe();
+    };
+  }, []);
 
   // Tránh nhấp nháy: sau đăng ký, Firebase có thể auto-login rất nhanh rồi signOut về anonymous.
   // Chỉ chuyển sang MainTabs khi user non-anonymous ổn định trong một khoảng ngắn.
   useEffect(() => {
+    let cancelled = false;
     let timer = null;
     if (user && !user.isAnonymous) {
       timer = setTimeout(() => {
-        setShowMainTabs(true);
+        void (async () => {
+          const suspendRace = Promise.race([
+            enforceNotSuspendedOrSignOut(),
+            new Promise(resolve =>
+              setTimeout(() => resolve({blocked: false}), SUSPENDED_CHECK_TIMEOUT_MS),
+            ),
+          ]);
+          const result = await suspendRace;
+          const blocked = Boolean(result?.blocked);
+          if (cancelled) return;
+          if (blocked) {
+            setShowMainTabs(false);
+            Alert.alert('Không thể đăng nhập', SUSPENDED_SIGN_OUT_MESSAGE);
+          } else {
+            setShowMainTabs(true);
+          }
+        })();
       }, 500);
     } else {
       setShowMainTabs(false);
     }
     return () => {
+      cancelled = true;
       if (timer) clearTimeout(timer);
     };
   }, [user]);
@@ -302,23 +391,12 @@ const AppNavigator = () => {
     if (!showMainTabs) {
       return undefined;
     }
-    let cancelled = false;
     void (async () => {
       try {
-        await ensureFirestoreAuthReady();
-        if (cancelled) {
-          return;
-        }
-        await Promise.all([
-          loadVideosFromFirebase({force: true}).catch(() => {}),
-          loadVocabularyFromFirebase({force: true}).catch(() => {}),
-          loadDialoguesFromFirebase().catch(() => {}),
-        ]);
+        await preloadEssentialData();
       } catch (_) {}
     })();
-    return () => {
-      cancelled = true;
-    };
+    return undefined;
   }, [showMainTabs]);
 
   if (initializing) {

@@ -12,10 +12,12 @@ import {useNavigation} from '@react-navigation/native';
 import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
-import {getLearningProgress} from '../../services/storageService';
+import {getLearningProgress, awardXPRepeatable} from '../../services/storageService';
+import {XP} from '../../services/levelService';
 import {
   markWordAsLearned,
   recordReviewQuizAnswer,
+  recordTopicPracticeMode,
 } from '../../services/vocabularyService';
 
 // Import TTS với error handling
@@ -47,6 +49,8 @@ const VocabularyListeningScreen = ({route}) => {
   
   const progressAnimation = useRef(new Animated.Value(0)).current;
   const fadeAnimation = useRef(new Animated.Value(1)).current;
+  const practiceRecordedRef = useRef(false);
+  const practiceXpAwardedRef = useRef(false);
 
   const currentWord = words && words[currentIndex] ? words[currentIndex] : null;
   const progress = words && words.length > 0 ? ((currentIndex + 1) / words.length) * 100 : 0;
@@ -97,6 +101,14 @@ const VocabularyListeningScreen = ({route}) => {
     let cancelled = false;
     (async () => {
       try {
+        if (!isReviewQuiz && !practiceXpAwardedRef.current) {
+          practiceXpAwardedRef.current = true;
+          await awardXPRepeatable(
+            `practice_listening_${String(topicId || 'unknown')}`,
+            XP.PRACTICE_COMPLETE_FIRST,
+            XP.PRACTICE_COMPLETE_REPEAT,
+          );
+        }
         const p = await getLearningProgress();
         const latest = Math.max(0, Number(p?.totalXP) || 0);
         if (!cancelled) {
@@ -107,7 +119,14 @@ const VocabularyListeningScreen = ({route}) => {
     return () => {
       cancelled = true;
     };
-  }, [isFinished, xpStart]);
+  }, [isFinished, isReviewQuiz, topicId, xpStart]);
+
+  useEffect(() => {
+    if (!isFinished || isReviewQuiz) return;
+    if (practiceRecordedRef.current) return;
+    practiceRecordedRef.current = true;
+    void recordTopicPracticeMode(topicId, 'listening');
+  }, [isFinished, isReviewQuiz, topicId]);
 
   useEffect(() => {
     // Kiểm tra và cấu hình TTS
@@ -478,13 +497,23 @@ const VocabularyListeningScreen = ({route}) => {
           </View>
 
           {/* Example (only show when correct) */}
-          {showResult && isCorrect && currentWord.example && (
+          {showResult && isCorrect && (
             <View style={styles.exampleContainer}>
               <Text style={styles.exampleLabel}>Ví dụ:</Text>
-              <Text style={styles.exampleText}>{currentWord.example}</Text>
-              <Text style={styles.exampleMeaningText}>
-                {currentWord.exampleMeaning}
-              </Text>
+              {currentWord.example ? (
+                <>
+                  <Text style={styles.exampleText}>{currentWord.example}</Text>
+                  {!!currentWord.exampleMeaning && (
+                    <Text style={styles.exampleMeaningText}>
+                      {currentWord.exampleMeaning}
+                    </Text>
+                  )}
+                </>
+              ) : (
+                <Text style={styles.exampleMissingText}>
+                  Chưa có ví dụ cho từ này.
+                </Text>
+              )}
             </View>
           )}
         </ScrollView>
@@ -739,6 +768,11 @@ const styles = StyleSheet.create({
   exampleMeaningText: {
     fontSize: 14,
     color: COLORS.TEXT_SECONDARY,
+  },
+  exampleMissingText: {
+    fontSize: 14,
+    color: COLORS.TEXT_LIGHT,
+    fontStyle: 'italic',
   },
   nextButtonContainer: {
     paddingHorizontal: 24,

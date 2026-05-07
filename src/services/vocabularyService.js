@@ -1,9 +1,24 @@
-import {lessonsData} from '../data/vocabularyData';
 import {getVocabulary, saveVocabulary, ensureFirestoreAuthReady} from './firebaseService';
 import {getLearningProgress, saveLearningProgress} from './storageService';
 import {loadVideosFromFirebase, getAllVideos} from './videoService';
 
 import {XP, computeLevelName} from './levelService';
+
+/** Chuẩn hóa loại từ (VN cũ → EN); giá trị đã là EN hoặc tùy chỉnh giữ nguyên. */
+const PART_OF_SPEECH_VI_TO_EN = {
+  'Danh từ': 'Noun',
+  'Động từ': 'Verb',
+  'Tính từ': 'Adjective',
+  'Trạng từ': 'Adverb',
+  'Cụm từ': 'Phrase',
+  'Khác': 'Other',
+};
+
+export function partOfSpeechToEnglish(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return '';
+  return PART_OF_SPEECH_VI_TO_EN[s] || s;
+}
 
 /** Bộ nhớ đệm — chỉ từ Firestore (config/vocabulary.words). */
 let _vocabularyCache = [];
@@ -40,12 +55,15 @@ function normalizeWordFromFirestore(raw) {
         : raw.topic != null && raw.topic !== ''
           ? raw.topic
           : '';
+  const posRaw = raw.partOfSpeech != null ? String(raw.partOfSpeech).trim() : '';
+  const partOfSpeech = posRaw ? partOfSpeechToEnglish(posRaw) : '';
   return {
     ...raw,
     id,
     category: String(catRaw).trim(),
     word: raw.word != null ? String(raw.word) : '',
     meaning: raw.meaning != null ? String(raw.meaning) : '',
+    partOfSpeech,
     // Tương thích dữ liệu cũ: một số bản lưu `exampleVi` thay vì `exampleMeaning`.
     exampleMeaning:
       raw.exampleMeaning != null && String(raw.exampleMeaning).trim() !== ''
@@ -57,12 +75,30 @@ function normalizeWordFromFirestore(raw) {
   };
 }
 
-/** Khớp từ với chủ đề (id chủ đề trên Firestore/seed = category của từ). */
-export function wordBelongsToTopic(word, topicId) {
+/**
+ * Khớp từ với bộ chủ đề.
+ * - Mô hình mới: document bộ có `wordIds` (id từ đã chọn trong kho).
+ * - Tương thích cũ: field `category` / `topicId` trên từ = id bộ.
+ * @param {object} word
+ * @param {string|number} topicId
+ * @param {Array<{id?: string, wordIds?: Array}>} [topicsList] — truyền danh sách bộ để đọc `wordIds`
+ */
+export function wordBelongsToTopic(word, topicId, topicsList) {
   if (!word || topicId == null) return false;
   const tid = String(topicId).trim();
+  if (!tid) return false;
+
+  const topics = Array.isArray(topicsList) ? topicsList : null;
+  const topic = topics ? topics.find((t) => String(t?.id) === tid) : null;
+  if (topic && Array.isArray(topic.wordIds) && topic.wordIds.length > 0) {
+    const sid = String(word.id);
+    if (topic.wordIds.some((wid) => String(wid) === sid)) {
+      return true;
+    }
+  }
+
   const c = String(word.category ?? word.topicId ?? word.topic ?? '').trim();
-  return c === tid && tid.length > 0;
+  return c === tid;
 }
 
 function setCacheFromRemoteList(list) {
@@ -204,8 +240,10 @@ export const getVocabularyById = (id) => {
 };
 
 // Lấy từ vựng theo chủ đề
-export const getVocabularyByCategory = (category) => {
-  return _vocabularyCache.filter((word) => wordBelongsToTopic(word, category));
+export const getVocabularyByCategory = (category, topicsList) => {
+  return _vocabularyCache.filter((word) =>
+    wordBelongsToTopic(word, category, topicsList),
+  );
 };
 
 /** Lấy danh sách từ theo thứ tự id (bỏ qua id không tồn tại). */
@@ -419,7 +457,7 @@ async function _markWordAsLearnedImpl(wordId, learned) {
   const wl = updatedProgress.wordsLearned.map((x) => String(x));
   const alreadyLearned = wl.includes(sid);
 
-  if (learned) {
+    if (learned) {
     if (!alreadyLearned) {
       updatedProgress.wordsLearned = [...new Set([...wl, sid])];
     }
@@ -456,6 +494,92 @@ export const markWordAsLearned = async (wordId, learned = true) => {
   const run = () =>
     _markWordAsLearnedImpl(wordId, learned).catch((error) => {
       console.error('Error marking word as learned:', error);
+      return false;
+    });
+  _markLearnedChain = _markLearnedChain.then(run, run);
+  return _markLearnedChain;
+};
+
+/**
+ * Đánh dấu nhiều từ trong một lần lưu progress (vd. sau video).
+ * Tránh N lần gọi Firestore lần lượt như vòng lặp markWordAsLearned.
+ */
+async function _markWordsLearnedBatchImpl(wordIds, learned = true) {
+  const ids = [
+    ...new Set(
+      (wordIds || [])
+        .map((id) => String(id ?? '').trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (!ids.length) return true;
+  try {
+    const progress = await getLearningProgress();
+    const updatedProgress = {
+      wordsLearned: [],
+      lessonsCompleted: [],
+      ...(progress || {}),
+    };
+    if (!Array.isArray(updatedProgress.wordsLearned)) {
+      updatedProgress.wordsLearned = [];
+    }
+    const wlArr = updatedProgress.wordsLearned.map((x) => String(x));
+    const prevSet = new Set(wlArr);
+
+    if (!updatedProgress.flashcardSelfReport || typeof updatedProgress.flashcardSelfReport !== 'object') {
+      updatedProgress.flashcardSelfReport = {};
+    }
+    const fsr = {...updatedProgress.flashcardSelfReport};
+
+    if (learned) {
+      const nextWl = new Set(wlArr);
+      let xpAdd = 0;
+      for (const sid of ids) {
+        if (!nextWl.has(sid)) {
+          nextWl.add(sid);
+          if (!prevSet.has(sid)) {
+            xpAdd += XP.NEW_WORD;
+          }
+        }
+        fsr[sid] = true;
+      }
+      updatedProgress.wordsLearned = [...nextWl];
+      updatedProgress.flashcardSelfReport = fsr;
+      let totalXP = Math.max(0, Number(updatedProgress.totalXP) || 0);
+      totalXP += xpAdd;
+      updatedProgress.totalXP = totalXP;
+      updatedProgress.level = computeLevelName(totalXP);
+    } else {
+      const removeSet = new Set(ids);
+      updatedProgress.wordsLearned = wlArr.filter((id) => !removeSet.has(id));
+      if (updatedProgress.wordStats && typeof updatedProgress.wordStats === 'object') {
+        const nextStats = {...updatedProgress.wordStats};
+        for (const sid of ids) {
+          delete nextStats[sid];
+        }
+        updatedProgress.wordStats = nextStats;
+      }
+      for (const sid of ids) {
+        fsr[sid] = false;
+      }
+      updatedProgress.flashcardSelfReport = fsr;
+    }
+
+    const saved = await saveLearningProgress(updatedProgress);
+    if (!saved) {
+      console.warn('markWordsLearnedBatch: không ghi được tiến độ.');
+    }
+    return saved;
+  } catch (error) {
+    console.error('Error markWordsLearnedBatch:', error);
+    return false;
+  }
+}
+
+export const markWordsLearnedBatch = async (wordIds, learned = true) => {
+  const run = () =>
+    _markWordsLearnedBatchImpl(wordIds, learned).catch((error) => {
+      console.error('Error markWordsLearnedBatch:', error);
       return false;
     });
   _markLearnedChain = _markLearnedChain.then(run, run);
@@ -512,6 +636,17 @@ export const commitFlashcardSessionWords = (sessionWords, explicitChuaBietIds) =
       }
       updated.flashcardSelfReport = fsr;
 
+      const prevWeak = Array.isArray(updated.weakWordIds)
+        ? updated.weakWordIds.map(String)
+        : [];
+      const wWeak = new Set(prevWeak);
+      for (const w of sessionWords) {
+        const sid = String(w.id);
+        if (chuaSet.has(sid)) wWeak.add(sid);
+        else wWeak.delete(sid);
+      }
+      updated.weakWordIds = [...wWeak];
+
       let xpAdd = 0;
       for (const w of sessionWords) {
         const sid = String(w.id);
@@ -532,6 +667,52 @@ export const commitFlashcardSessionWords = (sessionWords, explicitChuaBietIds) =
       return ok;
     } catch (error) {
       console.error('Error commitFlashcardSessionWords:', error);
+      return false;
+    }
+  };
+  _markLearnedChain = _markLearnedChain.then(run, run);
+  return _markLearnedChain;
+};
+
+/** Một id chỉ một lần trong danh sách câu hỏi — tránh lặp từ ở cuối bài do dữ liệu trùng. */
+export function dedupeVocabularyWordsById(words) {
+  if (!Array.isArray(words) || !words.length) return [];
+  const seen = new Set();
+  const out = [];
+  for (const w of words) {
+    const sid = String(w?.id ?? '');
+    if (!sid || seen.has(sid)) continue;
+    seen.add(sid);
+    out.push(w);
+  }
+  return out;
+}
+
+/**
+ * Gộp danh sách từ yếu (flashcard «Chưa biết» / quiz chủ đề sai).
+ * Chạy xếp hàng sau các thao tác markWordAsLearned.
+ */
+export const mergeWeakWordIds = (addIds = [], removeIds = []) => {
+  const run = async () => {
+    try {
+      const progress = await getLearningProgress();
+      const base = Array.isArray(progress?.weakWordIds)
+        ? progress.weakWordIds.map(String)
+        : [];
+      const s = new Set(base);
+      for (const id of addIds) {
+        const sid = String(id);
+        if (sid) s.add(sid);
+      }
+      for (const id of removeIds) {
+        s.delete(String(id));
+      }
+      return await saveLearningProgress({
+        ...(progress || {}),
+        weakWordIds: [...s],
+      });
+    } catch (error) {
+      console.error('Error mergeWeakWordIds:', error);
       return false;
     }
   };
@@ -575,6 +756,55 @@ export const commitReviewFlashcardSession = (sessionWords, explicitChuaBietIds) 
   return _markLearnedChain;
 };
 
+/**
+ * Ghi nhận người học đã hoàn thành 1 mode củng cố của 1 bộ từ.
+ * Dùng để tính tiến trình bộ từ theo nhiều bước (flashcard + luyện tập).
+ * `mode === 'mixed'` → ghi nhận đủ quiz, typing, listening (Mixed Practice sau flashcard).
+ */
+export const recordTopicPracticeMode = (topicId, mode) => {
+  const run = async () => {
+    try {
+      const tid = String(topicId || '').trim();
+      const normalizedMode = String(mode || '').trim().toLowerCase();
+      if (!tid || tid === 'review') return false;
+      const modesToAdd =
+        normalizedMode === 'mixed'
+          ? ['quiz', 'typing', 'listening']
+          : ['quiz', 'typing', 'listening'].includes(normalizedMode)
+            ? [normalizedMode]
+            : null;
+      if (!modesToAdd || !modesToAdd.length) return false;
+      const progress = await getLearningProgress();
+      const updated = {
+        ...(progress || {}),
+      };
+      const stats =
+        updated.topicPracticeStats && typeof updated.topicPracticeStats === 'object'
+          ? {...updated.topicPracticeStats}
+          : {};
+      const topicRow =
+        stats[tid] && typeof stats[tid] === 'object' ? {...stats[tid]} : {};
+      const prevModes = Array.isArray(topicRow.modesCompleted)
+        ? topicRow.modesCompleted.map((x) => String(x).trim().toLowerCase())
+        : [];
+      const nextSet = new Set(prevModes.filter((x) => x));
+      for (const m of modesToAdd) {
+        nextSet.add(String(m).trim().toLowerCase());
+      }
+      topicRow.modesCompleted = [...nextSet];
+      topicRow.updatedAt = Date.now();
+      stats[tid] = topicRow;
+      updated.topicPracticeStats = stats;
+      return saveLearningProgress(updated);
+    } catch (error) {
+      console.error('Error recordTopicPracticeMode:', error);
+      return false;
+    }
+  };
+  _markLearnedChain = _markLearnedChain.then(run, run);
+  return _markLearnedChain;
+};
+
 /** Trắc nghiệm / ôn tập: ghi nhận đúng/sai (chỉ dùng khi topicId === 'review'). */
 export const recordReviewQuizAnswer = (wordId, correct) => {
   const run = async () => {
@@ -590,9 +820,20 @@ export const recordReviewQuizAnswer = (wordId, correct) => {
       } else {
         set.add(sid);
       }
+      const stats =
+        progress?.wordStats && typeof progress.wordStats === 'object'
+          ? {...progress.wordStats}
+          : {};
+      const prevRow =
+        stats[sid] && typeof stats[sid] === 'object' ? stats[sid] : {};
+      stats[sid] = {
+        ...prevRow,
+        lastReviewedAt: Date.now(),
+      };
       return saveLearningProgress({
         ...(progress || {}),
         reviewWrongWordIds: [...set],
+        wordStats: stats,
       });
     } catch (error) {
       console.error('Error recordReviewQuizAnswer:', error);
@@ -663,6 +904,30 @@ export const isWordLearned = async (wordId) => {
     return progress.wordsLearned.some((id) => String(id) === sid);
   } catch (error) {
     console.error('Error checking word learned status:', error);
+    return false;
+  }
+};
+
+/**
+ * Cộng XP cho phiên luyện tập (quiz / ôn tập): mỗi câu đúng nhận XP.REVIEW_GOOD, có trần mỗi phiên.
+ * Khác với XP từ từ mới (markWordAsLearned).
+ */
+export const addPracticeSessionXp = async (amount) => {
+  const n = Math.max(0, Math.floor(Number(amount) || 0));
+  if (!n) {
+    return false;
+  }
+  try {
+    const progress = await getLearningProgress();
+    const totalXP = Math.max(0, Number(progress?.totalXP) || 0) + n;
+    await saveLearningProgress({
+      ...(progress || {}),
+      totalXP,
+      level: computeLevelName(totalXP),
+    });
+    return true;
+  } catch (e) {
+    console.warn('addPracticeSessionXp', e);
     return false;
   }
 };
@@ -757,14 +1022,94 @@ export function getVideoWordsListForVideo(video) {
   if (!video || typeof video !== 'object') {
     return [];
   }
+  // Ưu tiên tuyệt đối danh sách từ đã được admin gắn cho video.
+  // Chỉ fallback sang phụ đề khi video không có videoWords.
+  if (Array.isArray(video.videoWords) && video.videoWords.length > 0) {
+    return video.videoWords;
+  }
   const subtitleWords = getSubtitleRowsAsVideoWords(video);
   if (subtitleWords.length > 0) {
     return subtitleWords;
   }
-  if (Array.isArray(video.videoWords) && video.videoWords.length > 0) {
-    return video.videoWords;
-  }
   return getVocabularyMentionedInVideo(video);
+}
+
+/**
+ * Tra cứu nghĩa khi chạm từ trong phụ đề: từ videoWords / phụ đề + từ chủ đề xuất hiện trong transcript.
+ * Key: {@link normalizeEnglishWordKey} (từ đơn) hoặc {@link normalizeSubtitleTextKey} (cả dòng cụm).
+ */
+export function buildVideoTokenMeaningLookup(video) {
+  const map = new Map();
+  const put = (key, entry, force) => {
+    if (!key) {
+      return;
+    }
+    if (!force && map.has(key)) {
+      return;
+    }
+    map.set(key, entry);
+  };
+
+  for (const w of getVideoWordsListForVideo(video)) {
+    if (!w || typeof w !== 'object') {
+      continue;
+    }
+    const raw = String(w.word ?? '').trim();
+    if (!raw) {
+      continue;
+    }
+    const meaning = String(w.meaning ?? '').trim() || '—';
+    const entry = {
+      id: w.id,
+      display: raw,
+      meaning,
+      partOfSpeechVi: String(w.partOfSpeechVi ?? '').trim(),
+      source: 'video',
+    };
+    if (!/\s/.test(raw)) {
+      put(normalizeEnglishWordKey(raw), entry, true);
+    } else {
+      const pk = normalizeSubtitleTextKey(cleanSubtitleLearningText(raw));
+      if (pk) {
+        put(pk, entry, true);
+      }
+    }
+  }
+
+  for (const w of getVocabularyMentionedInVideo(video)) {
+    if (!w || typeof w !== 'object') {
+      continue;
+    }
+    const raw = String(w.word ?? '').trim();
+    if (!raw) {
+      continue;
+    }
+    const k = normalizeEnglishWordKey(raw);
+    if (!k || map.has(k)) {
+      continue;
+    }
+    map.set(k, {
+      id: w.id,
+      display: raw,
+      meaning: String(w.meaning ?? '').trim() || '—',
+      partOfSpeechVi: String(w.partOfSpeechVi ?? '').trim(),
+      source: 'topic',
+    });
+  }
+
+  return map;
+}
+
+/** Tra nghĩa một token tiếng Anh trong map từ {@link buildVideoTokenMeaningLookup}. */
+export function lookupVideoSubtitleToken(lookupMap, token) {
+  if (!lookupMap || !(lookupMap instanceof Map)) {
+    return null;
+  }
+  const k = normalizeEnglishWordKey(String(token ?? '').trim());
+  if (!k) {
+    return null;
+  }
+  return lookupMap.get(k) || null;
 }
 
 /**
@@ -893,11 +1238,17 @@ function buildResolvedLearnedWordsList(rawIds, videoWordById) {
 }
 
 async function loadLearningProgressForLearnedWords() {
-  let lp = await getLearningProgress({source: 'server'});
-  if (lp == null) {
-    lp = await getLearningProgress();
+  // Ưu tiên snapshot/cache giống các màn học; chỉ ép server khi snapshot chưa có dữ liệu (tránh race/ghim 0 với inflight).
+  let lp = await getLearningProgress();
+  const rawLen = Array.isArray(lp?.wordsLearned) ? lp.wordsLearned.length : 0;
+  const xp = Math.max(
+    0,
+    Number(lp?.totalXP) || Number(lp?.totalXp) || Number(lp?.xp) || 0,
+  );
+  if (rawLen === 0 && xp === 0) {
+    lp = await getLearningProgress({source: 'server'});
   }
-  return lp;
+  return lp != null ? lp : await getLearningProgress();
 }
 
 async function ensureCachesForLearnedWordsResolution() {
@@ -930,12 +1281,3 @@ export async function getLearnedWordsForDisplay() {
   return buildResolvedLearnedWordsList(rawIds, videoWordById);
 }
 
-// Lấy tất cả bài học
-export const getAllLessons = () => {
-  return lessonsData;
-};
-
-// Lấy bài học theo ID
-export const getLessonById = (id) => {
-  return lessonsData.find(lesson => lesson.id === id);
-};

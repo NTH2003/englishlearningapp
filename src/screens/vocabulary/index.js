@@ -6,4 +6,5 @@ export { default as VocabularyQuizScreen } from './VocabularyQuizScreen';
 export { default as VocabularyTypingScreen } from './VocabularyTypingScreen';
 export { default as VocabularyListeningScreen } from './VocabularyListeningScreen';
 export { default as VocabularyQuickChallengeScreen } from './VocabularyQuickChallengeScreen';
-export { default as VideoVocabularyStudyModeScreen } from './VideoVocabularyStudyModeScreen';
+export { default as VocabularyTopicDetailScreen } from './VocabularyTopicDetailScreen';
+export { default as VocabularyReviewHubScreen } from './VocabularyReviewHubScreen';

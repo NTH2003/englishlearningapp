@@ -20,6 +20,14 @@ const TEXT_GRAY_900 = '#111827';
 const TEXT_GRAY_600 = '#4B5563';
 const TEXT_GRAY_500 = '#6B7280';
 
+function getPartOfSpeechLabel(item) {
+  const vi = String(item?.partOfSpeechVi || '').trim();
+  if (vi) return vi;
+  const raw = String(item?.partOfSpeech || '').trim();
+  if (!raw) return '';
+  return raw;
+}
+
 let Tts = null;
 try {
   Tts = require('react-native-tts').default;
@@ -134,7 +142,7 @@ const LearnedVocabularyScreen = () => {
             keyExtractor={(item) => item.id}
             renderItem={({item}) => {
               const ipa = String(item.pronunciation || '').trim();
-              const pos = String(item.partOfSpeechVi || '').trim();
+              const pos = getPartOfSpeechLabel(item);
               const isPlaying = playingId === item.id;
               const playable = canPlayItem(item);
 

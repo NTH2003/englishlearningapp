@@ -10,6 +10,7 @@ import {
   Animated,
 } from 'react-native';
 import {useNavigation} from '@react-navigation/native';
+import {useSafeAreaInsets} from 'react-native-safe-area-context';
 import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
 import {getLearningProgress, saveLearningProgress} from '../../services/storageService';
@@ -17,6 +18,8 @@ import {computeLevelName, XP} from '../../services/levelService';
 import {recordReviewQuizAnswer} from '../../services/vocabularyService';
 
 const CHALLENGE_SECONDS = 60;
+const DEFAULT_PER_QUESTION_SECONDS = 8;
+const DEFAULT_LIVES = 3;
 const MODES = ['quiz', 'typing', 'listening'];
 const OPTION_LETTERS = ['A', 'B', 'C', 'D'];
 
@@ -36,6 +39,17 @@ function normalize(text) {
     .replace(/\s+/g, ' ');
 }
 
+function getPromptByMode(mode, word) {
+  if (mode === 'typing') return `Viết từ tiếng Anh có nghĩa "${word?.meaning || ''}"`;
+  if (mode === 'listening') return 'Nghe và chọn từ tiếng Anh đúng';
+  return `Nghĩa của từ "${word?.word || ''}" là gì?`;
+}
+
+function getCorrectAnswerByMode(mode, word) {
+  if (mode === 'typing' || mode === 'listening') return word?.word || '';
+  return word?.meaning || '';
+}
+
 let Tts = null;
 try {
   Tts = require('react-native-tts').default;
@@ -43,11 +57,21 @@ try {
 
 export default function VocabularyQuickChallengeScreen({route}) {
   const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const sourceWords = Array.isArray(route?.params?.words) ? route.params.words : [];
   const topicName = route?.params?.topicName || 'Thử thách 60 giây';
+  const challengeMode = String(route?.params?.challengeMode || 'classic');
+  const isLivesMode = challengeMode === 'fast_lives';
+  const perQuestionSeconds = Math.max(
+    4,
+    Number(route?.params?.perQuestionSeconds) || DEFAULT_PER_QUESTION_SECONDS,
+  );
+  const initialLives = Math.max(1, Number(route?.params?.lives) || DEFAULT_LIVES);
   const words = useMemo(() => sourceWords.filter((w) => w && w.id != null), [sourceWords]);
 
   const [timeLeft, setTimeLeft] = useState(CHALLENGE_SECONDS);
+  const [questionTimeLeft, setQuestionTimeLeft] = useState(perQuestionSeconds);
+  const [livesLeft, setLivesLeft] = useState(initialLives);
   const [running, setRunning] = useState(true);
   const [index, setIndex] = useState(0);
   const [typedAnswer, setTypedAnswer] = useState('');
@@ -64,8 +88,11 @@ export default function VocabularyQuickChallengeScreen({route}) {
   const usedRef = useRef(new Set());
   const xpAwardedRef = useRef(false);
   const progressAnimation = useRef(new Animated.Value(0)).current;
+  const currentWord = words.length ? words[index % words.length] : null;
+  const mode = MODES[index % MODES.length];
 
   useEffect(() => {
+    if (isLivesMode) return undefined;
     if (!running) return undefined;
     const id = setInterval(() => {
       setTimeLeft((t) => {
@@ -78,7 +105,54 @@ export default function VocabularyQuickChallengeScreen({route}) {
       });
     }, 1000);
     return () => clearInterval(id);
-  }, [running]);
+  }, [running, isLivesMode]);
+
+  useEffect(() => {
+    if (!isLivesMode || !running || finished) return undefined;
+    if (!currentWord) return undefined;
+    const id = setInterval(() => {
+      setQuestionTimeLeft((t) => {
+        if (t <= 1) {
+          setAttemptCount((n) => n + 1);
+          markWordNeedsReview(currentWord);
+          setAnswerHistory((prev) => [
+            ...prev,
+            {
+              index: prev.length,
+              mode,
+              prompt: getPromptByMode(mode, currentWord),
+              word: currentWord?.word || '',
+              userAnswer: '(hết giờ)',
+              correctAnswer: getCorrectAnswerByMode(mode, currentWord),
+              isCorrect: false,
+            },
+          ]);
+          setLivesLeft((lv) => {
+            const next = lv - 1;
+            if (next <= 0) {
+              setRunning(false);
+              setFinished(true);
+              return 0;
+            }
+            goNext();
+            return next;
+          });
+          return perQuestionSeconds;
+        }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [
+    isLivesMode,
+    running,
+    finished,
+    perQuestionSeconds,
+    currentWord?.id,
+    currentWord?.meaning,
+    currentWord?.word,
+    mode,
+  ]);
 
   useEffect(() => {
     try {
@@ -93,13 +167,21 @@ export default function VocabularyQuickChallengeScreen({route}) {
   }, []);
 
   useEffect(() => {
-    const pct = ((CHALLENGE_SECONDS - timeLeft) / CHALLENGE_SECONDS) * 100;
+    const pct = isLivesMode
+      ? (attemptCount / Math.max(1, words.length)) * 100
+      : ((CHALLENGE_SECONDS - timeLeft) / CHALLENGE_SECONDS) * 100;
     Animated.timing(progressAnimation, {
       toValue: Math.max(0, Math.min(100, pct)),
       duration: 250,
       useNativeDriver: false,
     }).start();
-  }, [timeLeft, progressAnimation]);
+  }, [
+    isLivesMode,
+    attemptCount,
+    words.length,
+    timeLeft,
+    progressAnimation,
+  ]);
 
   useEffect(() => {
     if (!finished || xpAwardedRef.current) return;
@@ -124,21 +206,24 @@ export default function VocabularyQuickChallengeScreen({route}) {
     })();
   }, [finished, score]);
 
-  const currentWord = words.length ? words[index % words.length] : null;
-  const mode = MODES[index % MODES.length];
-
   const options = useMemo(() => {
     if (!currentWord || words.length < 2) return [];
+    const optionKey = mode === 'listening' ? 'word' : 'meaning';
     const wrongs = shuffle(words.filter((w) => String(w.id) !== String(currentWord.id)))
       .slice(0, 3)
-      .map((w) => w.meaning);
-    return shuffle([currentWord.meaning, ...wrongs]);
-  }, [currentWord, words, index]);
+      .map((w) => w?.[optionKey])
+      .filter(Boolean);
+    const correct = currentWord?.[optionKey];
+    return shuffle([correct, ...wrongs].filter(Boolean));
+  }, [currentWord, words, mode, index]);
 
   const goNext = () => {
     setIndex((i) => i + 1);
     setTypedAnswer('');
     setSelectedAnswer(null);
+    if (isLivesMode) {
+      setQuestionTimeLeft(perQuestionSeconds);
+    }
   };
 
   const recordWrong = (word) => {
@@ -146,6 +231,12 @@ export default function VocabularyQuickChallengeScreen({route}) {
     if (usedRef.current.has(String(word.id))) return;
     usedRef.current.add(String(word.id));
     setWrongWords((prev) => [...prev, word]);
+  };
+
+  const markWordNeedsReview = (word) => {
+    if (!word || word.id == null) return;
+    void recordReviewQuizAnswer(word.id, false);
+    recordWrong(word);
   };
 
   const onCorrect = () => {
@@ -160,15 +251,10 @@ export default function VocabularyQuickChallengeScreen({route}) {
       {
         index: prev.length,
         mode,
-        prompt:
-          mode === 'typing'
-            ? `Viết từ tiếng Anh có nghĩa "${currentWord?.meaning || ''}"`
-            : mode === 'listening'
-              ? 'Nghe và chọn nghĩa đúng'
-              : `Nghĩa của từ "${currentWord?.word || ''}" là gì?`,
+        prompt: getPromptByMode(mode, currentWord),
         word: currentWord?.word || '',
         userAnswer: mode === 'typing' ? typedAnswer.trim() : selectedAnswer,
-        correctAnswer: mode === 'typing' ? currentWord?.word || '' : currentWord?.meaning || '',
+        correctAnswer: getCorrectAnswerByMode(mode, currentWord),
         isCorrect: true,
       },
     ]);
@@ -176,35 +262,41 @@ export default function VocabularyQuickChallengeScreen({route}) {
   };
 
   const onWrong = () => {
-    if (currentWord?.id != null) {
-      void recordReviewQuizAnswer(currentWord.id, false);
-    }
     setAttemptCount((n) => n + 1);
-    recordWrong(currentWord);
+    markWordNeedsReview(currentWord);
     setAnswerHistory((prev) => [
       ...prev,
       {
         index: prev.length,
         mode,
-        prompt:
-          mode === 'typing'
-            ? `Viết từ tiếng Anh có nghĩa "${currentWord?.meaning || ''}"`
-            : mode === 'listening'
-              ? 'Nghe và chọn nghĩa đúng'
-              : `Nghĩa của từ "${currentWord?.word || ''}" là gì?`,
+        prompt: getPromptByMode(mode, currentWord),
         word: currentWord?.word || '',
         userAnswer: mode === 'typing' ? typedAnswer.trim() : selectedAnswer,
-        correctAnswer: mode === 'typing' ? currentWord?.word || '' : currentWord?.meaning || '',
+        correctAnswer: getCorrectAnswerByMode(mode, currentWord),
         isCorrect: false,
       },
     ]);
+    if (isLivesMode) {
+      setLivesLeft((lv) => {
+        const next = lv - 1;
+        if (next <= 0) {
+          setRunning(false);
+          setFinished(true);
+          return 0;
+        }
+        goNext();
+        return next;
+      });
+      return;
+    }
     goNext();
   };
 
   const answerQuiz = (ans) => {
     if (finished || !currentWord) return;
     setSelectedAnswer(ans);
-    if (ans === currentWord.meaning) {
+    const correctAnswer = mode === 'listening' ? currentWord.word : currentWord.meaning;
+    if (ans === correctAnswer) {
       onCorrect();
       return;
     }
@@ -229,18 +321,6 @@ export default function VocabularyQuickChallengeScreen({route}) {
     }
   };
 
-  const reviewWrongWords = () => {
-    if (!wrongWords.length) {
-      navigation.goBack();
-      return;
-    }
-    navigation.replace('VocabularyTyping', {
-      words: wrongWords,
-      topicId: 'review',
-      topicName: 'Ôn lại từ sai',
-    });
-  };
-
   if (!words.length) {
     return (
       <SafeAreaView style={styles.container}>
@@ -261,37 +341,53 @@ export default function VocabularyQuickChallengeScreen({route}) {
   });
   const minute = String(Math.floor(timeLeft / 60)).padStart(1, '0');
   const second = String(timeLeft % 60).padStart(2, '0');
+  const perQSecond = String(questionTimeLeft).padStart(2, '0');
   const percent = attemptCount > 0 ? Math.round((correctCount / attemptCount) * 100) : 0;
 
   return (
     <SafeAreaView style={styles.container}>
-      <View style={[styles.topOrange, {paddingTop: Math.max(insets.top, 8) + 4}]}>
-        <View style={styles.header}>
-          <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()} hitSlop={10}>
-            <Feather name="arrow-left" size={22} color="#FFFFFF" />
-          </TouchableOpacity>
-          <View style={styles.headerBody}>
-            <Text style={styles.title}>Thử thách 60 giây</Text>
-            <Text style={styles.subTitle} numberOfLines={1}>
-              {topicName} · {attemptCount} câu
-            </Text>
+      {!finished ? (
+        <View style={[styles.topOrange, {paddingTop: Math.max(insets.top, 8) + 4}]}>
+          <View style={styles.header}>
+            <TouchableOpacity style={styles.backButton} onPress={() => navigation.goBack()} hitSlop={10}>
+              <Feather name="arrow-left" size={22} color="#FFFFFF" />
+            </TouchableOpacity>
+            <View style={styles.headerBody}>
+              <Text style={styles.title}>
+                {isLivesMode ? 'Ôn tập siêu tốc' : 'Thử thách 60 giây'}
+              </Text>
+              <Text style={styles.subTitle} numberOfLines={1}>
+                {topicName} · {attemptCount} câu
+              </Text>
+            </View>
+            <View style={styles.headerRightPills}>
+              {isLivesMode ? (
+                <View style={styles.lifePill}>
+                  <Feather name="heart" size={14} color="#FFFFFF" />
+                  <Text style={styles.timerText}>{livesLeft}</Text>
+                </View>
+              ) : null}
+              <View style={styles.timerPill}>
+                <Feather name="clock" size={14} color="#FFFFFF" />
+                <Text style={styles.timerText}>
+                  {isLivesMode ? `${perQSecond}s` : `${minute}:${second}`}
+                </Text>
+              </View>
+            </View>
           </View>
-          <View style={styles.timerPill}>
-            <Feather name="clock" size={14} color="#FFFFFF" />
-            <Text style={styles.timerText}>
-              {minute}:{second}
-            </Text>
+          <View style={styles.progressOuter}>
+            <Animated.View style={[styles.progressInner, {width: progressWidth}]} />
           </View>
         </View>
-        <View style={styles.progressOuter}>
-          <Animated.View style={[styles.progressInner, {width: progressWidth}]} />
-        </View>
-      </View>
+      ) : null}
 
       {finished ? (
         <ScrollView
           style={styles.resultScroll}
-          contentContainerStyle={styles.resultContent}
+          contentContainerStyle={[
+            styles.resultContent,
+            {paddingTop: Math.max(insets.top, 12) + 8},
+          ]}
           showsVerticalScrollIndicator={false}>
           <View style={styles.reviewSummaryCard}>
             <View style={styles.reviewSummaryIcon}>
@@ -303,27 +399,24 @@ export default function VocabularyQuickChallengeScreen({route}) {
             </Text>
             <View style={styles.reviewSummaryStats}>
               <View style={styles.reviewStatBoxLeft}>
-                <Text style={styles.reviewStatPrimaryOrange}>{percent}%</Text>
-                <Text style={styles.reviewStatLabel}>Tỷ lệ đúng</Text>
+                <Text style={styles.reviewStatPrimaryOrange}>
+                  {correctCount}/{attemptCount}
+                </Text>
+                <Text style={styles.reviewStatLabel}>Số câu đúng</Text>
               </View>
               <View style={styles.reviewStatBoxRight}>
-                <Text style={styles.reviewStatPrimaryBlue}>{score}</Text>
-                <Text style={styles.reviewStatLabel}>Tổng điểm</Text>
+                <Text style={styles.reviewStatPrimaryBlue}>+{sessionXp}</Text>
+                <Text style={styles.reviewStatLabel}>XP nhận</Text>
               </View>
             </View>
-            <Text style={styles.resultLine}>Đúng: {correctCount}/{attemptCount}</Text>
-            <Text style={styles.resultLine}>XP thưởng: +{sessionXp}</Text>
             <View style={styles.resultButtons}>
-              <TouchableOpacity style={styles.secondaryBtn} onPress={reviewWrongWords} activeOpacity={0.85}>
-                <Text style={styles.secondaryBtnText}>
-                  {wrongWords.length ? `Ôn lại ${wrongWords.length} từ sai` : 'Về ôn tập'}
-                </Text>
-              </TouchableOpacity>
               <TouchableOpacity
-                style={styles.primaryBtn}
+                style={[styles.primaryBtn, styles.resultPrimaryBtn]}
                 activeOpacity={0.85}
                 onPress={() => {
                   setTimeLeft(CHALLENGE_SECONDS);
+                  setQuestionTimeLeft(perQuestionSeconds);
+                  setLivesLeft(initialLives);
                   setRunning(true);
                   setIndex(0);
                   setTypedAnswer('');
@@ -338,9 +431,16 @@ export default function VocabularyQuickChallengeScreen({route}) {
                   setSessionXp(0);
                   setFinished(false);
                 }}>
-                <Text style={styles.primaryBtnText}>Chơi lại</Text>
+                <Text style={styles.primaryBtnText}>Ôn lại</Text>
               </TouchableOpacity>
             </View>
+            <TouchableOpacity
+              style={styles.backHomeBtn}
+              activeOpacity={0.85}
+              onPress={() => navigation.navigate('HomeTab', {screen: 'Home'})}>
+              <Feather name="home" size={16} color="#FFFFFF" />
+              <Text style={styles.backHomeBtnText}>Về trang chủ</Text>
+            </TouchableOpacity>
           </View>
 
           <Text style={styles.reviewDetailTitle}>Đáp án chi tiết</Text>
@@ -389,12 +489,14 @@ export default function VocabularyQuickChallengeScreen({route}) {
               {mode === 'typing'
                 ? 'Viết từ tiếng Anh có nghĩa:'
                 : mode === 'listening'
-                  ? 'Nghe và chọn nghĩa đúng'
+                  ? 'Nghe và chọn từ tiếng Anh đúng'
                   : 'Nghĩa của từ sau là gì?'}
             </Text>
-            <Text style={styles.keyword}>
-              {mode === 'typing' ? currentWord?.meaning : currentWord?.word}
-            </Text>
+            {mode !== 'listening' ? (
+              <Text style={styles.keyword}>
+                {mode === 'typing' ? currentWord?.meaning : currentWord?.word}
+              </Text>
+            ) : null}
             {mode !== 'typing' ? (
               <TouchableOpacity
                 style={styles.listenRow}
@@ -466,6 +568,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
   },
+  headerRightPills: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
   backButton: {
     width: 32,
     height: 32,
@@ -480,6 +587,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 6,
     backgroundColor: 'rgba(255,255,255,0.24)',
+    borderRadius: 12,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  lifePill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: 'rgba(239,68,68,0.88)',
     borderRadius: 12,
     paddingHorizontal: 10,
     paddingVertical: 6,
@@ -619,13 +735,13 @@ const styles = StyleSheet.create({
     padding: 14,
     alignItems: 'center',
   },
-  primaryBtnDisabled: {
-    backgroundColor: '#D1D5DB',
-  },
   primaryBtnText: {
     fontSize: 16,
     fontWeight: '700',
     color: '#FFFFFF',
+  },
+  primaryBtnDisabled: {
+    backgroundColor: '#D1D5DB',
   },
   secondaryBtn: {
     flex: 1,
@@ -645,8 +761,31 @@ const styles = StyleSheet.create({
   resultButtons: {
     marginTop: 14,
     width: '100%',
+    flexDirection: 'column',
+    gap: 8,
+  },
+  resultPrimaryBtn: {
+    width: '100%',
+    minHeight: 46,
+    justifyContent: 'center',
+  },
+  backHomeBtn: {
+    marginTop: 10,
+    height: 44,
+    width: '100%',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: COLORS.PRIMARY_DARK,
+    backgroundColor: COLORS.PRIMARY_DARK,
+    alignItems: 'center',
+    justifyContent: 'center',
     flexDirection: 'row',
-    gap: 10,
+    gap: 8,
+  },
+  backHomeBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#FFFFFF',
   },
   resultScroll: {flex: 1},
   resultContent: {

@@ -1,7 +1,6 @@
-import {dialogueScenarios as seedDialogues} from '../data/dialogueData';
 import {getDialogueConfig, saveDialogueConfig} from './firebaseService';
 
-let _dialogueCache = Array.isArray(seedDialogues) ? [...seedDialogues] : [];
+let _dialogueCache = [];
 let _dialogueTopicsCache = [];
 
 function normalizeTopicId(raw) {
@@ -28,10 +27,26 @@ function inferTopicsFromDialogues(dialogues) {
   return [...map.values()];
 }
 
+function normalizeDialogueTurn(turn, index) {
+  const speaker = String(turn?.speaker || '').trim() || (index % 2 === 0 ? 'A' : 'B');
+  const text = String(turn?.text || turn?.line || '').trim();
+  if (!text) return null;
+  return {
+    id: String(turn?.id || `turn_${index}`).trim(),
+    speaker,
+    text,
+    translation: String(turn?.translation || turn?.meaning || '').trim(),
+    audioUrl: String(turn?.audioUrl || turn?.audio || '').trim(),
+    hint: String(turn?.hint || '').trim(),
+  };
+}
+
 function normalizeDialogueRow(row, index) {
   const id = String(row?.id || `dialogue_${Date.now()}_${index}`).trim();
   const topicId = normalizeTopicId(row?.topicId || 'general');
-  const turns = Array.isArray(row?.turns) ? row.turns : [];
+  const turns = (Array.isArray(row?.turns) ? row.turns : [])
+    .map(normalizeDialogueTurn)
+    .filter(Boolean);
   const suggestions = Array.isArray(row?.suggestions) ? row.suggestions : [];
   return {
     ...row,
@@ -74,14 +89,24 @@ export function getDialogueById(id) {
   return _dialogueCache.find((x) => String(x.id) === sid) || null;
 }
 
+export function getDialoguePracticeTurns(id) {
+  const row = getDialogueById(id);
+  if (!row) return [];
+  return Array.isArray(row.turns) ? row.turns : [];
+}
+
 export async function loadDialoguesFromFirebase(options = {}) {
   try {
     const cfg = await getDialogueConfig(options);
     const serverDialogues = Array.isArray(cfg?.dialogues) ? cfg.dialogues : null;
     const serverTopics = Array.isArray(cfg?.topics) ? cfg.topics : null;
     if (!serverDialogues || serverDialogues.length === 0) {
-      _dialogueCache = Array.isArray(seedDialogues) ? [...seedDialogues] : [];
-      _dialogueTopicsCache = inferTopicsFromDialogues(_dialogueCache);
+      // Tránh xóa cache khi lần đọc tạm thời rỗng (auth/network chậm).
+      if (_dialogueCache.length > 0) {
+        return _dialogueCache;
+      }
+      _dialogueCache = [];
+      _dialogueTopicsCache = [];
       return _dialogueCache;
     }
     _dialogueCache = serverDialogues.map(normalizeDialogueRow);
@@ -94,8 +119,8 @@ export async function loadDialoguesFromFirebase(options = {}) {
         : inferTopicsFromDialogues(_dialogueCache);
     return _dialogueCache;
   } catch (_) {
-    _dialogueCache = Array.isArray(seedDialogues) ? [...seedDialogues] : [];
-    _dialogueTopicsCache = inferTopicsFromDialogues(_dialogueCache);
+    _dialogueCache = [];
+    _dialogueTopicsCache = [];
     return _dialogueCache;
   }
 }

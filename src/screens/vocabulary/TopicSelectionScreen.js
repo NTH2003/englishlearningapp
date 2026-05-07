@@ -1,12 +1,11 @@
-import React, { useState, useCallback, useMemo, memo, useContext, useEffect, useRef } from "react"
+import React, { useState, useCallback, useMemo, useContext, useEffect, useRef } from "react"
 import {
   View,
   Text,
   StyleSheet,
   ScrollView,
   TouchableOpacity,
-  Modal,
-  Dimensions,
+  ActivityIndicator,
   RefreshControl,
   Alert,
   TextInput,
@@ -29,20 +28,73 @@ import { getTopics, saveTopics, getLearningProgress } from "../../services/stora
 import { LEARNING_PROGRESS_UPDATED } from "../../services/learningProgressEvents"
 import FilterChip from "./FilterChip"
 import { VocabularyTabContext } from "../../contexts/VocabularyTabContext"
+import { VocabularyTopicCard } from "./VocabularyTopicCard"
 
-const { height: SCREEN_HEIGHT } = Dimensions.get("window")
+// Giữ danh sách chủ đề tốt gần nhất xuyên qua remount của màn,
+// tránh trường hợp getTopics() trả rỗng tạm thời làm UI trắng.
+let _stickyTopicsCache = []
 
-const STAT_BLUE = "#2563EB"
-const STAT_GREEN = "#16A34A"
+function computeTopicProgressPercent({ learnedCount, totalCount }) {
+  const total = Math.max(0, Number(totalCount) || 0)
+  if (total <= 0) return 0
+  const learned = Math.max(0, Number(learnedCount) || 0)
+  return Math.round(Math.min(1, learned / total) * 100)
+}
 
-function getTopicFeatherIcon(topicId) {
-  const map = {
-    Food: "book-open",
-    Travel: "map-pin",
-    "Daily Life": "home",
-    Technology: "cpu",
+function progressScore(lp) {
+  if (!lp || typeof lp !== "object") return 0
+  const words = Array.isArray(lp?.wordsLearned) ? lp.wordsLearned.length : 0
+  const dialogues = Array.isArray(lp?.dialoguesCompleted) ? lp.dialoguesCompleted.length : 0
+  const videos = Array.isArray(lp?.videosWatched) ? lp.videosWatched.length : 0
+  const xp = Math.max(0, Number(lp?.totalXP) || Number(lp?.totalXp) || Number(lp?.xp) || 0)
+  return words * 100000 + dialogues * 1000 + videos * 100 + xp
+}
+
+function hasCompletedTopicExam(lp, topicId) {
+  const tid = String(topicId || "").trim()
+  if (!tid) return false
+  const row = lp?.topicPracticeStats?.[tid]
+  if (!row || typeof row !== "object") return false
+  const set = new Set(
+    (Array.isArray(row.modesCompleted) ? row.modesCompleted : [])
+      .map((m) => String(m || "").trim().toLowerCase())
+      .filter(Boolean),
+  )
+  return set.has("quiz") && set.has("typing") && set.has("listening")
+}
+
+function buildTopicWordDebugSnapshot(allWords, topic, topicWords) {
+  if (!__DEV__) return null
+  const topicId = String(topic?.id ?? "").trim()
+  const topicSlug = String(topic?.slug ?? "").trim()
+  const categoryMatches = allWords.filter(
+    (w) => String(w?.category ?? "").trim() === topicId,
+  ).length
+  const topicIdMatches = allWords.filter(
+    (w) => String(w?.topicId ?? "").trim() === topicId,
+  ).length
+  const topicFieldMatches = allWords.filter(
+    (w) => String(w?.topic ?? "").trim() === topicId,
+  ).length
+  const slugAsCategoryMatches = topicSlug
+    ? allWords.filter((w) => String(w?.category ?? "").trim() === topicSlug).length
+    : 0
+  const sampleWords = allWords.slice(0, 5).map((w) => ({
+    id: String(w?.id ?? ""),
+    category: String(w?.category ?? ""),
+    topicId: String(w?.topicId ?? ""),
+    topic: String(w?.topic ?? ""),
+  }))
+  return {
+    topicId,
+    topicSlug,
+    topicWordCount: topicWords.length,
+    categoryMatches,
+    topicIdMatches,
+    topicFieldMatches,
+    slugAsCategoryMatches,
+    sampleWords,
   }
-  return map[topicId] || "layers"
 }
 
 const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
@@ -50,23 +102,60 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
   const insets = useSafeAreaInsets()
   const vocabTab = useContext(VocabularyTabContext)
   const embedInRoot = vocabTab?.embedInRoot === true
-  const [topics, setTopics] = useState([])
+  const [topics, setTopics] = useState(
+    Array.isArray(_stickyTopicsCache) ? _stickyTopicsCache : [],
+  )
   const [topicsProgress, setTopicsProgress] = useState({})
-  const [initialLoading, setInitialLoading] = useState(true)
-  const [selectedTopic, setSelectedTopic] = useState(null)
-  const [previewWords, setPreviewWords] = useState([])
-  const [showPreviewModal, setShowPreviewModal] = useState(false)
+  const [initialLoading, setInitialLoading] = useState(
+    !(
+      Array.isArray(_stickyTopicsCache) &&
+      _stickyTopicsCache.length > 0 &&
+      getAllVocabulary().length > 0
+    ),
+  )
   const [refreshing, setRefreshing] = useState(false)
   const [savingTopics, setSavingTopics] = useState(false)
   const [filter, setFilter] = useState("all")
   const [searchQuery, setSearchQuery] = useState("")
   const [userWordLevel, setUserWordLevel] = useState("all") // all | Beginner | Intermediate
+  const dlog = (...args) => {
+    if (__DEV__) console.log("[TopicSelection]", ...args)
+  }
 
   /** Tránh nhiều load song song: bản cũ xong sau ghi đè → topics = [] / tiến độ 0. */
   const loadGenerationRef = useRef(0)
   const loadingGuardRef = useRef(null)
+  const loadPromiseRef = useRef(null)
+  const lastLoadAtRef = useRef(0)
+  const lastForceLoadAtRef = useRef(0)
+  const topicsStateRef = useRef([])
+  /** Khi lần tải chủ đề trả về rỗng (timeout/mạng) nhưng UI vẫn giữ danh sách cũ — vẫn tính tiến độ theo bản cuối cùng có dữ liệu. */
+  const lastNonEmptyTopicsRef = useRef(Array.isArray(_stickyTopicsCache) ? _stickyTopicsCache : [])
+  /** Khi cache từ chưa nạp kịp, tránh ghi đè tiến độ đúng bằng toàn 0; thử tải lại có giới hạn. */
+  const vocabProgressRetryRef = useRef(0)
+  /** Đã từng tải được chủ đề từ getTopics (Firestore/CMS) — không suy từ slug trong từ vựng để tránh ghi đè tên tiếng Việt khi request sau bị timeout. */
+  const hadSuccessfulGetTopicsRef = useRef(false)
 
-  const loadTopicsAndProgress = useCallback(async (readProgressFromServer = false) => {
+  const loadTopicsAndProgress = useCallback(async ({ readProgressFromServer = false, force = false } = {}) => {
+    dlog("load:start", { readProgressFromServer, force })
+    // Dù force hay không, luôn tránh tạo nhiều request chồng nhau.
+    if (loadPromiseRef.current) {
+      dlog("load:skip-inflight")
+      return loadPromiseRef.current
+    }
+    // Event tiến độ có thể bắn dày; force-load liên tiếp sẽ làm spam request/getTopics trả rỗng tạm thời.
+    if (force && Date.now() - lastForceLoadAtRef.current < 1200) {
+      dlog("load:skip-force-throttle")
+      return
+    }
+    if (!force && Date.now() - lastLoadAtRef.current < 1200) {
+      dlog("load:skip-throttle")
+      return
+    }
+    if (force) {
+      lastForceLoadAtRef.current = Date.now()
+    }
+    const runner = (async () => {
     const gen = ++loadGenerationRef.current
     const withTimeout = (p, ms) =>
       Promise.race([
@@ -74,8 +163,19 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
         new Promise((_, rej) => setTimeout(() => rej(new Error("timeout")), ms)),
       ])
 
-    /** Không để frame «Chưa có chủ đề» khi remount ([] ban đầu). */
-    setTopics((prev) => (Array.isArray(prev) ? prev : []))
+    /** Warm start: có cache thì render ngay, không hiện spinner khi quay lại từ màn học. */
+    const hasWarmTopics =
+      Array.isArray(lastNonEmptyTopicsRef.current) && lastNonEmptyTopicsRef.current.length > 0
+    const hasWarmWords = getAllVocabulary().length > 0
+    if (hasWarmTopics && hasWarmWords) {
+      setTopics((prev) =>
+        Array.isArray(prev) && prev.length > 0 ? prev : lastNonEmptyTopicsRef.current,
+      )
+      setInitialLoading(false)
+    } else {
+      /** Không để frame «Chưa có chủ đề» khi remount ([] ban đầu). */
+      setTopics((prev) => (Array.isArray(prev) ? prev : []))
+    }
     if (loadingGuardRef.current) {
       clearTimeout(loadingGuardRef.current)
     }
@@ -91,38 +191,72 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
           await withTimeout(loadVocabularyFromFirebase(), 3500)
         } catch (_) {}
       }
+      dlog("vocab:initial-count", getAllVocabulary().length)
+
+      const topicsFromCache =
+        topicsStateRef.current.length > 0
+          ? topicsStateRef.current
+          : (lastNonEmptyTopicsRef.current.length > 0
+              ? lastNonEmptyTopicsRef.current
+              : _stickyTopicsCache)
+      const canReuseTopicsWithoutFetch =
+        force &&
+        !readProgressFromServer &&
+        Array.isArray(topicsFromCache) &&
+        topicsFromCache.length > 0
 
       let topicsToUse = []
-      try {
-        const list = await withTimeout(getTopics([]), 5000)
-        if (Array.isArray(list) && list.length > 0) {
-          topicsToUse = list
-        } else {
+      if (canReuseTopicsWithoutFetch) {
+        topicsToUse = topicsFromCache
+        dlog("topics:reuse-cache-count", topicsToUse.length)
+      } else {
+        try {
+          const list = await withTimeout(getTopics(), 5000)
+          dlog("topics:first-fetch", Array.isArray(list) ? list.length : null)
+          if (Array.isArray(list) && list.length > 0) {
+            topicsToUse = list
+            hadSuccessfulGetTopicsRef.current = true
+          } else {
+            topicsToUse = []
+          }
+          if (!topicsToUse?.length) {
+            topicsToUse = []
+          }
+        } catch (_) {
           topicsToUse = []
         }
-        if (!topicsToUse?.length) {
-          topicsToUse = []
-        }
-      } catch (_) {
-        topicsToUse = []
       }
 
       // Lần mở đầu có thể auth/network chưa sẵn sàng; retry nhẹ 1 lần.
-      if (!topicsToUse.length) {
+      if (!topicsToUse.length && !canReuseTopicsWithoutFetch) {
         try {
           await new Promise((r) => setTimeout(r, 1200))
-          const listRetry = await withTimeout(getTopics([]), 4000)
+          const listRetry = await withTimeout(getTopics(), 4000)
+          dlog("topics:retry-fetch", Array.isArray(listRetry) ? listRetry.length : null)
           if (Array.isArray(listRetry) && listRetry.length > 0) {
             topicsToUse = listRetry
+            hadSuccessfulGetTopicsRef.current = true
           }
         } catch (_) {}
       }
 
       const safeTopics =
         Array.isArray(topicsToUse) && topicsToUse.length > 0 ? topicsToUse : []
+      dlog("topics:safe-count", safeTopics.length)
+
+      if (safeTopics.length > 0) {
+        lastNonEmptyTopicsRef.current = safeTopics
+        _stickyTopicsCache = safeTopics
+      }
+      let topicsForProgress =
+        safeTopics.length > 0
+          ? safeTopics
+          : (lastNonEmptyTopicsRef.current.length > 0
+              ? lastNonEmptyTopicsRef.current
+              : _stickyTopicsCache)
 
       if (gen !== loadGenerationRef.current) return
-      setTopics(safeTopics)
+      setTopics((prev) => (safeTopics.length > 0 ? safeTopics : prev))
       // Có danh sách chủ đề thì bỏ loading ngay; tiến độ có thể cập nhật sau.
       setInitialLoading(false)
 
@@ -135,16 +269,31 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
           allWords = getAllVocabulary()
         } catch (_) {}
       }
-      const progress = {}
-      let lp = null
+      dlog("vocab:after-force-count", allWords.length)
 
-      try {
-        lp = await getLearningProgress(
-          readProgressFromServer ? { source: "server" } : {},
-        )
-      } catch (_) {
-        lp = null
+      const progress = {}
+      let lpServer = null
+      let lpLocal = null
+      if (readProgressFromServer) {
+        try {
+          lpServer = await getLearningProgress({ source: "server" })
+        } catch (_) {
+          lpServer = null
+        }
       }
+      try {
+        lpLocal = await getLearningProgress()
+      } catch (_) {
+        lpLocal = null
+      }
+      let lp = progressScore(lpServer) >= progressScore(lpLocal) ? lpServer : lpLocal
+      if (!lp || typeof lp !== "object") {
+        lp = lpLocal || lpServer || null
+      }
+      dlog("progress:summary", {
+        wordsLearned: Array.isArray(lp?.wordsLearned) ? lp.wordsLearned.length : 0,
+        totalXP: Math.max(0, Number(lp?.totalXP) || Number(lp?.totalXp) || Number(lp?.xp) || 0),
+      })
 
       if (gen !== loadGenerationRef.current) return
 
@@ -153,10 +302,16 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
           ? lp.wordsLearned.map((id) => String(id))
           : [],
       )
-
-      for (const topic of safeTopics) {
-        const topicWords = allWords.filter((word) => wordBelongsToTopic(word, topic.id))
-
+      for (const topic of topicsForProgress) {
+        const topicWords = allWords.filter((word) =>
+          wordBelongsToTopic(word, topic.id, topicsForProgress),
+        )
+        if (__DEV__) {
+          const snapshot = buildTopicWordDebugSnapshot(allWords, topic, topicWords)
+          if (snapshot && (snapshot.topicWordCount === 0 || snapshot.topicWordCount < 3)) {
+            dlog("topicWords:debug", snapshot)
+          }
+        }
         const learnedCount = topicWords.filter((word) =>
           learnedIds.has(String(word.id)),
         ).length
@@ -169,13 +324,59 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
         progress[topic.id] = {
           total: topicWords.length,
           learned: learnedCount,
-          percentage: topicWords.length > 0 ? Math.round((learnedCount / topicWords.length) * 100) : 0,
+          percentage: computeTopicProgressPercent({
+            learnedCount,
+            totalCount: topicWords.length,
+          }),
           level: levelName,
           mainLevel,
+          examCompleted: hasCompletedTopicExam(lp, topic.id),
         }
       }
       if (gen !== loadGenerationRef.current) return
-      setTopicsProgress(progress)
+
+      // Ẩn các bộ "trống" (0 từ) — thường là seed topics không khớp kho từ vựng hiện tại.
+      const nonEmptyTopics = topicsForProgress.filter(
+        (t) => (progress[String(t?.id)]?.total ?? 0) > 0,
+      )
+      dlog("topics:non-empty-count", nonEmptyTopics.length)
+      if (nonEmptyTopics.length > 0) {
+        // Dù fetch hiện tại trả rỗng tạm thời, vẫn ưu tiên danh sách bộ hợp lệ đã tính được
+        // để tránh trạng thái "trang từ vựng rỗng" sau khi học xong.
+        setTopics(nonEmptyTopics)
+        topicsForProgress = nonEmptyTopics
+        lastNonEmptyTopicsRef.current = nonEmptyTopics
+        _stickyTopicsCache = nonEmptyTopics
+      }
+
+      const vocabEmpty = allWords.length === 0
+      const progressAllZeroTotals =
+        topicsForProgress.length > 0 &&
+        Object.keys(progress).length > 0 &&
+        Object.values(progress).every((p) => (p?.total ?? 0) === 0)
+      const shouldSkipZeroWipe =
+        vocabEmpty && progressAllZeroTotals && topicsForProgress.length > 0
+
+      if (shouldSkipZeroWipe && vocabProgressRetryRef.current < 5) {
+        vocabProgressRetryRef.current += 1
+        setTimeout(() => {
+          if (gen === loadGenerationRef.current) {
+            void loadTopicsAndProgress({ readProgressFromServer, force: true })
+          }
+        }, 700)
+      } else {
+        vocabProgressRetryRef.current = 0
+        // Nếu lần tải này cho progress rỗng hoàn toàn nhưng trước đó đã có dữ liệu,
+        // giữ nguyên để tránh "trắng giả" do request tạm thời.
+        const hasAnyProgressKey = Object.keys(progress).length > 0
+        if (hasAnyProgressKey || topicsForProgress.length > 0) {
+          setTopicsProgress(progress)
+        }
+      }
+      dlog("load:done", {
+        renderedTopics: Array.isArray(topicsForProgress) ? topicsForProgress.length : 0,
+        progressKeys: Object.keys(progress).length,
+      })
 
       // Lấy level của người học để lọc chủ đề phù hợp (tận dụng lp ở trên nếu có)
       try {
@@ -199,33 +400,83 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
       if (gen === loadGenerationRef.current) {
         setInitialLoading(false)
       }
+      dlog("load:finally", { gen, currentGen: loadGenerationRef.current })
+    }
+  })()
+    loadPromiseRef.current = runner
+    try {
+      await runner
+      lastLoadAtRef.current = Date.now()
+    } finally {
+      if (loadPromiseRef.current === runner) {
+        loadPromiseRef.current = null
+      }
     }
   }, [])
 
+  const refreshProgressOnly = useCallback(async () => {
+    try {
+      const topicsForProgress =
+        Array.isArray(topics) && topics.length > 0 ? topics : lastNonEmptyTopicsRef.current
+      if (!Array.isArray(topicsForProgress) || topicsForProgress.length === 0) return
+
+      let allWords = getAllVocabulary()
+      if (!Array.isArray(allWords) || allWords.length === 0) return
+
+      const lp = (await getLearningProgress().catch(() => null)) || {}
+      const learnedIds = new Set(
+        Array.isArray(lp?.wordsLearned) ? lp.wordsLearned.map((id) => String(id)) : [],
+      )
+      const next = {}
+      for (const topic of topicsForProgress) {
+        const topicWords = allWords.filter((word) =>
+          wordBelongsToTopic(word, topic.id, topicsForProgress),
+        )
+        const learnedCount = topicWords.filter((word) =>
+          learnedIds.has(String(word.id)),
+        ).length
+        const beginnerCount = topicWords.filter((w) => w.level === "Beginner").length
+        const intermediateCount = topicWords.filter((w) => w.level === "Intermediate").length
+        const mainLevel = beginnerCount >= intermediateCount ? "Beginner" : "Intermediate"
+        const levelName = mainLevel === "Beginner" ? "Sơ cấp" : "Trung cấp"
+        next[topic.id] = {
+          total: topicWords.length,
+          learned: learnedCount,
+          percentage: computeTopicProgressPercent({
+            learnedCount,
+            totalCount: topicWords.length,
+          }),
+          level: levelName,
+          mainLevel,
+          examCompleted: hasCompletedTopicExam(lp, topic.id),
+        }
+      }
+      setTopicsProgress(next)
+    } catch (_) {}
+  }, [topics])
+
   /** Sau khi quay lại tab / tick > 0: đọc tiến độ từ server để không dùng cache Firestore cũ (0 từ đã học). */
   useEffect(() => {
-    loadTopicsAndProgress(rootFocusTick > 0)
+    loadTopicsAndProgress({ readProgressFromServer: rootFocusTick > 0 })
   }, [rootFocusTick, loadTopicsAndProgress])
 
-    /** Sau khi lưu tiến độ xong (kể cả flashcard lưu nền) — focus có thể chạy trước khi ghi Firestore xong. */
-  const reloadDebounceRef = useRef(null)
+  /** Sau khi lưu tiến độ xong: chỉ cập nhật tiến độ cục bộ, không reload cả màn danh sách. */
   useEffect(() => {
     const sub = DeviceEventEmitter.addListener(LEARNING_PROGRESS_UPDATED, (payload) => {
-      if (payload?.resetTopicFilters) {
+      // Sau khi học xong 1 bộ, filter hiện tại (vd. Đang học) có thể không còn mục nào
+      // và tạo cảm giác "rỗng". Luôn quay về Tất cả để hiển thị đầy đủ.
+      const shouldResetFilters = payload?.resetTopicFilters !== false
+      if (shouldResetFilters) {
         setFilter("all")
         setSearchQuery("")
       }
-      if (reloadDebounceRef.current) clearTimeout(reloadDebounceRef.current)
-      reloadDebounceRef.current = setTimeout(() => {
-        reloadDebounceRef.current = null
-        loadTopicsAndProgress(true)
-      }, 120)
+      // Cập nhật tức thì từ snapshot local, không chờ round-trip server.
+      void refreshProgressOnly()
     })
     return () => {
       sub.remove()
-      if (reloadDebounceRef.current) clearTimeout(reloadDebounceRef.current)
     }
-  }, [loadTopicsAndProgress])
+  }, [refreshProgressOnly])
 
   useEffect(() => {
     return () => {
@@ -236,9 +487,13 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
     }
   }, [])
 
+  useEffect(() => {
+    topicsStateRef.current = Array.isArray(topics) ? topics : []
+  }, [topics])
+
   const onRefresh = useCallback(async () => {
     setRefreshing(true)
-    await loadTopicsAndProgress(true)
+    await loadTopicsAndProgress({ readProgressFromServer: true, force: true })
     setRefreshing(false)
   }, [loadTopicsAndProgress])
 
@@ -251,32 +506,19 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
       return
     }
     const allWords = getAllVocabulary()
-    const topicWords = allWords.filter((word) => wordBelongsToTopic(word, topicId))
+    const topicWords = allWords.filter((word) =>
+      wordBelongsToTopic(word, topicId, topics),
+    )
 
     if (topicWords.length === 0) return
 
     const topic = topics.find((t) => t.id === topicId)
-    setSelectedTopic(topic)
-    setPreviewWords(topicWords)
-    setShowPreviewModal(true)
-  }
-
-  const handleStartLearning = () => {
-    setShowPreviewModal(false)
-    if (!selectedTopic || !previewWords?.length) {
-      return
-    }
-    navigation.navigate("VocabularyFlashcard", {
-      topicId: selectedTopic.id,
-      topicName: selectedTopic.name,
-      words: previewWords,
+    const progress = getTopicProgress(topicId)
+    navigation.navigate("VocabularyTopicDetail", {
+      topic,
+      words: topicWords,
+      progress,
     })
-  }
-
-  const handleClosePreview = () => {
-    setShowPreviewModal(false)
-    setSelectedTopic(null)
-    setPreviewWords([])
   }
 
   const handleSaveTopicsToFirebase = useCallback(async () => {
@@ -285,7 +527,7 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
       const result = await saveTopics(topics)
       if (result.ok) {
         Alert.alert("Thành công", "Đã lưu chủ đề lên Firebase.")
-        await loadTopicsAndProgress(true)
+        await loadTopicsAndProgress({ readProgressFromServer: true, force: true })
       } else {
         Alert.alert("Lỗi", result.error || "Không lưu được.")
       }
@@ -311,15 +553,19 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
   const getTopicStatus = (topicId) => {
     const p = getTopicProgress(topicId)
     if (!p.total || p.percentage === 0) return "not_started"
+    if (p.percentage === 100 && !p.examCompleted) return "ready_for_exam"
     if (p.percentage === 100) return "completed"
     return "in_progress"
   }
 
   const overallStats = (() => {
-    const totalTopics = topics.length
+    const visibleTopics = topics.filter(
+      (t) => getTopicStatus(t.id) !== "completed",
+    )
+    const totalTopics = visibleTopics.length
     let learned = 0
     let total = 0
-    topics.forEach((t) => {
+    visibleTopics.forEach((t) => {
       const p = getTopicProgress(t.id)
       learned += p.learned || 0
       total += p.total || 0
@@ -329,15 +575,19 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
   })()
 
   const filteredAndSearchedTopics = useMemo(() => {
-    let result = topics.filter((topic) => {
-      // Apply status filter
+    // Bộ đã hoàn thành kiểm tra chỉ hiển thị ở tab «Ôn tập», không trùng danh sách bộ từ vựng.
+    let result = topics.filter(
+      (topic) => getTopicStatus(topic.id) !== "completed",
+    )
+    result = result.filter((topic) => {
+      // Apply status filter (mỗi chip khớp đúng một trạng thái; «Chờ kiểm tra» = ready_for_exam)
       if (filter !== "all" && getTopicStatus(topic.id) !== filter) {
         return false
       }
       // Apply search filter
       if (searchQuery.trim()) {
         const query = searchQuery.toLowerCase()
-        return String(topic.name || "").toLowerCase().includes(query) || String(topic.description || "").toLowerCase().includes(query)
+        return String(topic.name || "").toLowerCase().includes(query)
       }
       return true
     })
@@ -345,6 +595,21 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
     // Guard: nếu filter/search rỗng mà vẫn ra 0 do dữ liệu không chuẩn, trả full list.
     if (filter === "all" && !searchQuery.trim() && result.length === 0 && topics.length > 0) {
       result = topics
+    }
+
+    // Ở tab "Tất cả": ưu tiên bộ chờ kiểm tra -> đang học -> chưa học.
+    if (filter === "all") {
+      const statusPriority = {
+        ready_for_exam: 0,
+        in_progress: 1,
+        not_started: 2,
+      }
+      result = [...result].sort((a, b) => {
+        const pa = statusPriority[getTopicStatus(a.id)] ?? 99
+        const pb = statusPriority[getTopicStatus(b.id)] ?? 99
+        if (pa !== pb) return pa - pb
+        return String(a?.name || "").localeCompare(String(b?.name || ""), "vi")
+      })
     }
 
     return result
@@ -367,7 +632,6 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
           {!embedInRoot && (
             <View style={styles.heroOrange}>
               <Text style={styles.heroTitle}>Từ vựng</Text>
-              <Text style={styles.heroSubtitle}>Học và ôn tập từ vựng tiếng Anh</Text>
             </View>
           )}
         </View>
@@ -377,7 +641,7 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
             <Feather name="search" size={18} color={COLORS.TEXT_SECONDARY} style={styles.searchIconFeather} />
             <TextInput
               style={styles.searchInput}
-              placeholder="Tìm tên bộ hoặc mô tả..."
+              placeholder="Tìm tên bộ..."
               placeholderTextColor={COLORS.TEXT_SECONDARY}
               value={searchQuery}
               onChangeText={setSearchQuery}
@@ -403,15 +667,10 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
             onPress={() => setFilter("in_progress")}
           />
           <FilterChip
-            label="Hoàn thành"
-            active={filter === "completed"}
-            onPress={() => setFilter("completed")}
+            label="Chờ kiểm tra"
+            active={filter === "ready_for_exam"}
+            onPress={() => setFilter("ready_for_exam")}
           />
-        </View>
-
-        <View style={styles.sectionHeaderBlock}>
-          <Text style={styles.sectionTitleSticky}>Bộ từ vựng</Text>
-          <Text style={styles.sectionHintSticky}>Chọn bộ để xem trước từ và học flashcard</Text>
         </View>
       </View>
 
@@ -426,11 +685,7 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
         <View style={styles.content}>
           {initialLoading ? (
             <View style={styles.emptyState}>
-              <Text style={styles.emptyStateIcon}>⏳</Text>
-              <Text style={styles.emptyStateTitle}>Đang tải dữ liệu...</Text>
-              <Text style={styles.emptyStateText}>
-                Vui lòng đợi trong giây lát.
-              </Text>
+              <ActivityIndicator size="large" color={COLORS.PRIMARY_DARK} />
             </View>
           ) : filteredAndSearchedTopics.length === 0 && topics.length === 0 && !refreshing ? (
             <View style={styles.emptyState}>
@@ -444,20 +699,19 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
             <View style={styles.emptyState}>
               <Text style={styles.emptyStateIcon}>🔍</Text>
               <Text style={styles.emptyStateTitle}>Không tìm thấy chủ đề</Text>
-              <Text style={styles.emptyStateText}>
-                Thử thay đổi bộ lọc hoặc tìm kiếm với từ khóa khác.
-              </Text>
             </View>
           ) : (
             filteredAndSearchedTopics.map((topic) => {
               const progress = getTopicProgress(topic.id)
+              const status = getTopicStatus(topic.id)
               const isLocked =
                 userWordLevel === "Beginner" && progress.mainLevel === "Intermediate"
               return (
-                <TopicCard
+                <VocabularyTopicCard
                   key={topic.id}
                   topic={topic}
                   progress={progress}
+                  status={status}
                   locked={isLocked}
                   onPress={() => handleTopicSelect(topic.id, isLocked)}
                 />
@@ -467,143 +721,9 @@ const TopicSelectionScreen = ({ rootFocusTick = 0 }) => {
         </View>
       </ScrollView>
 
-      <PreviewModal
-        visible={showPreviewModal}
-        topic={selectedTopic}
-        words={previewWords}
-        insets={insets}
-        onStartLearning={handleStartLearning}
-        onClose={handleClosePreview}
-      />
     </View>
   )
 }
-
-const TopicCard = memo(({ topic, progress, locked, onPress }) => {
-  const iconName = getTopicFeatherIcon(topic.id)
-  return (
-    <TouchableOpacity
-      style={[
-        styles.topicCard,
-        styles.topicCardShadow,
-        locked && styles.topicCardLocked,
-      ]}
-      onPress={onPress}
-      activeOpacity={0.7}
-    >
-      <View style={[styles.topicTopAccent, { backgroundColor: topic.color }]} />
-      <View style={styles.topicCardInner}>
-        <View style={styles.topicRowMain}>
-          <View style={[styles.iconContainer, { backgroundColor: topic.color + "18" }]}>
-            <Feather name={iconName} size={26} color={topic.color} />
-          </View>
-          <View style={styles.topicInfo}>
-            <Text style={styles.topicName}>{topic.name}</Text>
-            <View style={styles.topicMetaRow}>
-              <Text style={styles.topicWordCount}>
-                {progress.learned}/{progress.total} từ
-              </Text>
-            </View>
-            <View style={styles.topicProgressTrack}>
-              <View
-                style={[
-                  styles.topicProgressFill,
-                  {
-                    width: `${Math.min(100, progress.percentage)}%`,
-                    backgroundColor: topic.color,
-                  },
-                ]}
-              />
-            </View>
-          </View>
-          <View style={styles.topicChevronWrap}>
-            {locked ? (
-              <Feather name="lock" size={22} color={COLORS.TEXT_LIGHT} />
-            ) : (
-              <Feather name="chevron-right" size={22} color={COLORS.TEXT_LIGHT} />
-            )}
-          </View>
-        </View>
-      </View>
-    </TouchableOpacity>
-  )
-})
-
-TopicCard.displayName = "TopicCard"
-
-const PreviewModal = ({ visible, topic, words, insets, onStartLearning, onClose }) => {
-  const previewList = (words || []).slice(0, 6)
-  const remaining = Math.max((words?.length || 0) - previewList.length, 0)
-
-  return (
-  <Modal visible={visible} transparent={true} animationType="slide" onRequestClose={onClose}>
-    <View style={styles.modalOverlay}>
-      <View style={[styles.modalContent, { paddingBottom: Math.max(insets.bottom, 20) }]}>
-        {/* Modal Header */}
-        <View style={styles.modalHeader}>
-          <View style={styles.modalHeaderContent}>
-            {topic && (
-              <>
-                <View style={[styles.modalIconContainer, { backgroundColor: topic.color + "20" }]}>
-                  <Feather name={getTopicFeatherIcon(topic.id)} size={24} color={topic.color} />
-                </View>
-                <View>
-                  <Text style={styles.modalTitle}>{topic.name}</Text>
-                  <Text style={styles.modalSubtitle}>{words.length} từ vựng</Text>
-                </View>
-              </>
-            )}
-          </View>
-          <TouchableOpacity style={styles.closeButton} onPress={onClose} activeOpacity={0.7}>
-            <Feather name="x" size={20} color={COLORS.TEXT_SECONDARY} />
-          </TouchableOpacity>
-        </View>
-
-        {/* Words List */}
-        <View style={styles.wordsListContainer}>
-          <Text style={styles.wordsListTitle}>Xem trước từ vựng</Text>
-          <ScrollView
-            style={styles.wordsList}
-            showsVerticalScrollIndicator={true}
-            contentContainerStyle={styles.wordsListContent}
-          >
-            {previewList.map((word, index) => (
-              <View key={word.id} style={styles.wordItem}>
-                <View style={[styles.wordNumber, topic && { backgroundColor: topic.color + "25" }]}>
-                  <Text style={[styles.wordNumberText, topic && { color: topic.color }]}>
-                    {index + 1}
-                  </Text>
-                </View>
-                <View style={styles.wordContent}>
-                  <Text style={styles.wordText}>{word.word}</Text>
-                  <Text style={styles.wordPronunciation}>{word.pronunciation}</Text>
-                  <Text style={styles.wordMeaning}>{word.meaning}</Text>
-                </View>
-              </View>
-            ))}
-          </ScrollView>
-          {remaining > 0 && (
-            <Text style={styles.moreWordsText}>+ {remaining} từ khác</Text>
-          )}
-        </View>
-
-        {/* Footer */}
-        <View style={styles.modalFooter}>
-          <TouchableOpacity style={styles.cancelButton} onPress={onClose} activeOpacity={0.7}>
-            <Text style={styles.cancelButtonText}>Đóng</Text>
-          </TouchableOpacity>
-          <TouchableOpacity
-            style={[styles.startButton, topic && { backgroundColor: topic.color }]}
-            onPress={onStartLearning}
-            activeOpacity={0.7}
-          >
-            <Text style={styles.startButtonText}>Bắt đầu học</Text>
-          </TouchableOpacity>
-        </View>
-      </View>
-    </View>
-  </Modal>
-)}
 
 const styles = StyleSheet.create({
   wrapper: {
@@ -637,12 +757,7 @@ const styles = StyleSheet.create({
     fontSize: 26,
     fontWeight: "800",
     color: "#FFFFFF",
-    marginBottom: 6,
-  },
-  heroSubtitle: {
-    fontSize: 14,
-    color: "rgba(255,255,255,0.92)",
-    fontWeight: "500",
+    marginBottom: 2,
   },
   statsCardEmbedded: {
     marginTop: 4,
@@ -690,22 +805,6 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   /** Cùng vùng cố định với thống kê / tìm / lọc — không trôi khi cuộn danh sách */
-  sectionHeaderBlock: {
-    paddingHorizontal: 20,
-    marginTop: 10,
-    marginBottom: 8,
-  },
-  sectionTitleSticky: {
-    fontSize: 18,
-    fontWeight: "800",
-    color: COLORS.TEXT,
-  },
-  sectionHintSticky: {
-    fontSize: 13,
-    color: COLORS.TEXT_SECONDARY,
-    marginTop: 4,
-    fontWeight: "500",
-  },
   header: {
     paddingHorizontal: 20,
     paddingTop: 16,
@@ -828,87 +927,16 @@ const styles = StyleSheet.create({
   },
   content: {
     paddingHorizontal: 16,
-    paddingTop: 0,
+    paddingTop: 12,
     paddingBottom: 8,
   },
   filterRow: {
     flexDirection: "row",
     paddingHorizontal: 16,
     paddingTop: 4,
-    paddingBottom: 4,
+    paddingBottom: 12,
     flexWrap: "wrap",
     gap: 6,
-  },
-  topicCard: {
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderRadius: 16,
-    marginBottom: 12,
-    overflow: "hidden",
-    position: "relative",
-  },
-  topicCardLocked: {
-    opacity: 0.62,
-  },
-  topicTopAccent: {
-    height: 4,
-    width: "100%",
-  },
-  topicCardInner: {
-    paddingHorizontal: 14,
-    paddingVertical: 14,
-  },
-  topicRowMain: {
-    flexDirection: "row",
-    alignItems: "center",
-  },
-  topicCardShadow: {
-    ...THEME.shadow.soft,
-  },
-  iconContainer: {
-    width: 52,
-    height: 52,
-    borderRadius: 14,
-    justifyContent: "center",
-    alignItems: "center",
-    marginRight: 12,
-  },
-  topicInfo: {
-    flex: 1,
-    minWidth: 0,
-  },
-  topicName: {
-    fontSize: 17,
-    fontWeight: "700",
-    color: COLORS.TEXT,
-    marginBottom: 6,
-  },
-  topicMetaRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: 8,
-  },
-  topicWordCount: {
-    fontSize: 12,
-    color: COLORS.TEXT_LIGHT,
-    fontWeight: "600",
-  },
-  topicProgressTrack: {
-    height: 6,
-    borderRadius: 999,
-    backgroundColor: COLORS.BORDER,
-    overflow: "hidden",
-  },
-  topicProgressFill: {
-    height: "100%",
-    borderRadius: 999,
-  },
-  topicChevronWrap: {
-    width: 28,
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: 4,
   },
   statusIndicator: {
     marginLeft: 8,
@@ -941,153 +969,6 @@ const styles = StyleSheet.create({
   statusTagText: {
     fontSize: 11,
     fontWeight: "600",
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: "rgba(0, 0, 0, 0.5)",
-    justifyContent: "flex-end",
-  },
-  modalContent: {
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    height: SCREEN_HEIGHT * 0.5,
-    flexDirection: "column",
-    overflow: "hidden",
-  },
-  modalHeader: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
-    padding: 16,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.BORDER,
-  },
-  modalHeaderContent: {
-    flexDirection: "row",
-    alignItems: "center",
-    flex: 1,
-  },
-  modalIconContainer: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    justifyContent: "center",
-    alignItems: "center",
-    marginRight: 10,
-  },
-  modalTitle: {
-    fontSize: 18,
-    fontWeight: "600",
-    color: COLORS.TEXT,
-    marginBottom: 2,
-  },
-  modalSubtitle: {
-    fontSize: 13,
-    color: COLORS.TEXT_SECONDARY,
-  },
-  closeButton: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: COLORS.BACKGROUND,
-    justifyContent: "center",
-    alignItems: "center",
-  },
-  wordsListContainer: {
-    flex: 1,
-    minHeight: 200,
-  },
-  wordsListTitle: {
-    fontSize: 13,
-    fontWeight: "600",
-    color: COLORS.TEXT_SECONDARY,
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 4,
-  },
-  wordsList: {
-    flex: 1,
-  },
-  wordsListContent: {
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-  },
-  wordItem: {
-    flexDirection: "row",
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: COLORS.BORDER,
-  },
-  wordNumber: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    backgroundColor: "#FF8C42" + "20",
-    justifyContent: "center",
-    alignItems: "center",
-    marginRight: 10,
-  },
-  wordNumberText: {
-    fontSize: 12,
-    fontWeight: "600",
-    color: "#FF8C42",
-  },
-  wordContent: {
-    flex: 1,
-  },
-  wordText: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: COLORS.TEXT,
-    marginBottom: 2,
-  },
-  wordPronunciation: {
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-    fontStyle: "italic",
-    marginBottom: 2,
-  },
-  wordMeaning: {
-    fontSize: 14,
-    color: COLORS.PRIMARY_DARK,
-  },
-  modalFooter: {
-    flexDirection: "row",
-    padding: 16,
-    gap: 10,
-    borderTopWidth: 1,
-    borderTopColor: COLORS.BORDER,
-    backgroundColor: COLORS.BACKGROUND_WHITE,
-  },
-  cancelButton: {
-    flex: 1,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: COLORS.BACKGROUND,
-    alignItems: "center",
-  },
-  cancelButtonText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: COLORS.TEXT_SECONDARY,
-  },
-  startButton: {
-    flex: 1.5,
-    paddingVertical: 12,
-    borderRadius: 10,
-    alignItems: "center",
-  },
-  startButtonText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: COLORS.BACKGROUND_WHITE,
-  },
-  moreWordsText: {
-    marginTop: 4,
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: "center",
   },
 })
 

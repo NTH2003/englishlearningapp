@@ -1,12 +1,11 @@
 /**
- * Tất cả màn hình app – import từ đây để dùng trong navigation.
+ * Màn hình app – import từ đây để dùng trong navigation.
  * Cấu trúc thư mục:
- *   auth/     – Đăng nhập, Đăng ký
- *   main/     – Trang chủ, Hồ sơ, Hoạt động của tôi
- *   vocabulary/ – Học từ vựng (chủ đề, flashcard, quiz, gõ từ, nghe)
- *   video/    – Chọn video, Xem video
- *   dialogue/ – Giới thiệu hội thoại, Thực hành hội thoại
- *   lesson/   – Chi tiết bài học
+ *   auth/       – Đăng nhập, Đăng ký
+ *   main/       – Trang chủ, Hồ sơ, bảng xếp hạng
+ *   vocabulary/ – Học từ vựng
+ *   video/      – Chọn video, Xem video
+ *   dialogue/   – Hội thoại
  */
 
 export { LoginScreen, RegisterScreen } from './auth';
@@ -15,7 +14,6 @@ export {
   ProfileScreen,
   LearningPathScreen,
   LearnedVocabularyScreen,
-  AdminScreen,
 } from './main';
 export {
   VocabularyRootScreen,
@@ -26,8 +24,8 @@ export {
   VocabularyTypingScreen,
   VocabularyListeningScreen,
   VocabularyQuickChallengeScreen,
-  VideoVocabularyStudyModeScreen,
+  VocabularyTopicDetailScreen,
+  VocabularyReviewHubScreen,
 } from './vocabulary';
 export { VideoSelectionScreen, VideoLearningScreen } from './video';
 export { DialogueIntroScreen, DialoguePracticeScreen } from './dialogue';
-export { LessonDetailScreen } from './lesson';

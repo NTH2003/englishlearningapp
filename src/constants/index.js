@@ -1,3 +1,5 @@
+import {Platform} from 'react-native';
+
 // Colors - Theme nền sáng, màu nhấn cam/kem giống Home
 export const COLORS = {
   // Cam chủ đạo theo mock màn hình (~#FF7B00)
@@ -32,5 +34,13 @@ export const CLOUDINARY = {
   UPLOAD_PRESET: 'english_app',
 };
 
-// AI server (OpenAI proxy). Android emulator uses 10.0.2.2 to reach host machine.
-export const AI_SERVER_URL = 'http://10.0.2.2:3001';
+// AI server (OpenAI proxy). Có thể override bằng biến global để linh hoạt theo môi trường.
+function getDefaultAiServerHost() {
+  if (Platform.OS === 'android') {
+    return '10.0.2.2';
+  }
+  return '127.0.0.1';
+}
+
+export const AI_SERVER_URL =
+  global?.__AI_SERVER_URL__ || `http://${getDefaultAiServerHost()}:3001`;

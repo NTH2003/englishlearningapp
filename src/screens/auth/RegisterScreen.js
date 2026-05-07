@@ -1,31 +1,26 @@
-import React, {useState, useCallback} from 'react';
+import React, {useState, useCallback, useEffect, useMemo} from 'react';
 import {
   View,
   Text,
   StyleSheet,
   TextInput,
   TouchableOpacity,
-  SafeAreaView,
   KeyboardAvoidingView,
   Platform,
   ActivityIndicator,
   Alert,
 } from 'react-native';
-import {useNavigation} from '@react-navigation/native';
+import {SafeAreaView, useSafeAreaInsets} from 'react-native-safe-area-context';
+import {useNavigation, useFocusEffect} from '@react-navigation/native';
 import LinearGradient from 'react-native-linear-gradient';
+import Feather from 'react-native-vector-icons/Feather';
 import {COLORS} from '../../constants';
 import {THEME} from '../../theme';
-
-function getAuthService() {
-  try {
-    return require('../../services/firebaseService');
-  } catch (_) {
-    return null;
-  }
-}
+import * as authService from '../../services/firebaseService';
 
 const RegisterScreen = () => {
   const navigation = useNavigation();
+  const insets = useSafeAreaInsets();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -33,6 +28,33 @@ const RegisterScreen = () => {
   const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const confirmMismatch = useMemo(
+    () =>
+      confirmPassword.length > 0 &&
+      password.length > 0 &&
+      confirmPassword !== password,
+    [confirmPassword, password],
+  );
+
+  useFocusEffect(
+    useCallback(() => {
+      setEmail('');
+      setPassword('');
+      setConfirmPassword('');
+      setShowPassword(false);
+      setShowConfirmPassword(false);
+      setError('');
+      return undefined;
+    }, []),
+  );
+
+  useEffect(() => {
+    const unsub = navigation.addListener('beforeRemove', (e) => {
+      if (!loading) return;
+      e.preventDefault();
+    });
+    return unsub;
+  }, [navigation, loading]);
 
   const handleRegister = useCallback(async () => {
     setError('');
@@ -55,15 +77,9 @@ const RegisterScreen = () => {
       return;
     }
 
-    const auth = getAuthService();
-    if (!auth) {
-      setError('Tính năng đăng ký chưa khả dụng.');
-      return;
-    }
-
     setLoading(true);
     try {
-      const result = await auth.signUpWithEmail(trimmedEmail, password);
+      const result = await authService.signUpWithEmail(trimmedEmail, password);
       if (result.ok) {
         setError('');
         Alert.alert(
@@ -75,11 +91,14 @@ const RegisterScreen = () => {
               onPress: async () => {
                 // Đảm bảo sau khi đăng ký xong vẫn phải đăng nhập mới vào Home
                 try {
-                  await auth.signOut?.();
+                  await authService.signOut?.();
                 } catch (_) {
                   // ignore
                 }
-                navigation.navigate('Login');
+                navigation.reset({
+                  index: 0,
+                  routes: [{name: 'Login'}],
+                });
               },
             },
           ],
@@ -98,18 +117,20 @@ const RegisterScreen = () => {
     navigation.navigate('Login');
   }, [navigation]);
 
+  const heroTopPad = insets.top + 20;
+
   return (
-    <SafeAreaView style={styles.container}>
+    <SafeAreaView style={styles.container} edges={['bottom', 'left', 'right']}>
       <LinearGradient
         colors={THEME.gradient.hero}
         start={{x: 0, y: 0}}
         end={{x: 1, y: 1}}
-        style={styles.hero}>
+        style={[styles.hero, {paddingTop: heroTopPad}]}>
         <View style={styles.brandWrap}>
           <View style={styles.logoIcon}>
             <Text style={styles.logoEmoji}>📚</Text>
           </View>
-          <Text style={styles.brandTitle}>EasyEng</Text>
+          <Text style={styles.brandTitle}>EnglishApp</Text>
           <Text style={styles.brandSubtitle}>Học tiếng Anh mỗi ngày</Text>
         </View>
       </LinearGradient>
@@ -120,9 +141,6 @@ const RegisterScreen = () => {
         <View style={styles.scrollContent}>
           <View style={[styles.card, THEME.shadow.card]}>
             <Text style={styles.cardTitle}>Đăng ký</Text>
-            <Text style={styles.cardSubtitle}>
-              Tạo tài khoản để đồng bộ tiến độ học tập
-            </Text>
 
             {error ? (
               <View style={styles.errorBox}>
@@ -134,10 +152,15 @@ const RegisterScreen = () => {
             <View style={styles.fieldWrap}>
               <Text style={styles.label}>Email</Text>
               <View style={styles.inputWrap}>
-                <Text style={styles.inputIcon}>✉</Text>
+                <Feather
+                  name="mail"
+                  size={18}
+                  color={COLORS.TEXT_SECONDARY}
+                  style={styles.inputLeadingIcon}
+                />
                 <TextInput
                   style={styles.input}
-                  placeholder="name@example.com"
+                  placeholder="user@email.com"
                   placeholderTextColor={COLORS.TEXT_LIGHT}
                   value={email}
                   onChangeText={(v) => {
@@ -156,7 +179,12 @@ const RegisterScreen = () => {
             <View style={styles.fieldWrap}>
               <Text style={styles.label}>Mật khẩu</Text>
               <View style={styles.inputWrap}>
-                <Text style={styles.inputIcon}>🔒</Text>
+                <Feather
+                  name="lock"
+                  size={18}
+                  color={COLORS.TEXT_SECONDARY}
+                  style={styles.inputLeadingIcon}
+                />
                 <TextInput
                   style={[styles.input, styles.inputPassword]}
                   placeholder="Ít nhất 6 ký tự"
@@ -174,10 +202,14 @@ const RegisterScreen = () => {
                   onPress={() => setShowPassword(!showPassword)}
                   disabled={loading}
                   hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
+                  accessibilityRole="button"
+                  accessibilityLabel={showPassword ? 'Ẩn mật khẩu' : 'Hiện mật khẩu'}
                 >
-                  <Text style={styles.eyeIcon}>
-                    {showPassword ? '🙈' : '👁'}
-                  </Text>
+                  <Feather
+                    name={showPassword ? 'eye-off' : 'eye'}
+                    size={20}
+                    color={COLORS.TEXT_SECONDARY}
+                  />
                 </TouchableOpacity>
               </View>
             </View>
@@ -186,7 +218,12 @@ const RegisterScreen = () => {
             <View style={styles.fieldWrap}>
               <Text style={styles.label}>Xác nhận mật khẩu</Text>
               <View style={styles.inputWrap}>
-                <Text style={styles.inputIcon}>🔒</Text>
+                <Feather
+                  name="lock"
+                  size={18}
+                  color={COLORS.TEXT_SECONDARY}
+                  style={styles.inputLeadingIcon}
+                />
                 <TextInput
                   style={[styles.input, styles.inputPassword]}
                   placeholder="Nhập lại mật khẩu"
@@ -204,12 +241,21 @@ const RegisterScreen = () => {
                   onPress={() => setShowConfirmPassword(!showConfirmPassword)}
                   disabled={loading}
                   hitSlop={{top: 12, bottom: 12, left: 12, right: 12}}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    showConfirmPassword ? 'Ẩn xác nhận mật khẩu' : 'Hiện xác nhận mật khẩu'
+                  }
                 >
-                  <Text style={styles.eyeIcon}>
-                    {showConfirmPassword ? '🙈' : '👁'}
-                  </Text>
+                  <Feather
+                    name={showConfirmPassword ? 'eye-off' : 'eye'}
+                    size={20}
+                    color={COLORS.TEXT_SECONDARY}
+                  />
                 </TouchableOpacity>
               </View>
+              {confirmMismatch ? (
+                <Text style={styles.inlineFieldError}>Mật khẩu xác nhận chưa khớp.</Text>
+              ) : null}
             </View>
 
             {/* Register Button */}
@@ -234,14 +280,6 @@ const RegisterScreen = () => {
               </TouchableOpacity>
             </View>
           </View>
-
-          {/* Footer */}
-          <Text style={styles.footer}>
-            Bằng việc đăng ký, bạn đồng ý với{' '}
-            <Text style={styles.footerLink}>Điều khoản sử dụng</Text>
-            {' '}và{' '}
-            <Text style={styles.footerLink}>Chính sách bảo mật</Text>
-          </Text>
         </View>
       </KeyboardAvoidingView>
     </SafeAreaView>
@@ -254,7 +292,6 @@ const styles = StyleSheet.create({
     backgroundColor: COLORS.BACKGROUND,
   },
   hero: {
-    paddingTop: 12,
     paddingBottom: 52,
     paddingHorizontal: 24,
     borderBottomLeftRadius: THEME.radius.xxl,
@@ -312,12 +349,9 @@ const styles = StyleSheet.create({
     fontSize: 24,
     fontWeight: 'bold',
     color: COLORS.TEXT,
-    marginBottom: 4,
-  },
-  cardSubtitle: {
-    fontSize: 14,
-    color: COLORS.TEXT_SECONDARY,
     marginBottom: 20,
+    textAlign: 'center',
+    width: '100%',
   },
   errorBox: {
     backgroundColor: COLORS.ERROR + '15',
@@ -329,6 +363,12 @@ const styles = StyleSheet.create({
   },
   errorText: {
     fontSize: 14,
+    color: COLORS.ERROR,
+  },
+  inlineFieldError: {
+    marginTop: 8,
+    fontSize: 12,
+    fontWeight: '600',
     color: COLORS.ERROR,
   },
   fieldWrap: {
@@ -349,10 +389,8 @@ const styles = StyleSheet.create({
     borderColor: COLORS.BORDER,
     paddingHorizontal: 12,
   },
-  inputIcon: {
-    fontSize: 16,
+  inputLeadingIcon: {
     marginRight: 10,
-    color: COLORS.TEXT_SECONDARY,
   },
   input: {
     flex: 1,
@@ -366,9 +404,8 @@ const styles = StyleSheet.create({
   },
   eyeBtn: {
     padding: 8,
-  },
-  eyeIcon: {
-    fontSize: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   registerBtn: {
     height: 48,
@@ -400,17 +437,6 @@ const styles = StyleSheet.create({
     fontSize: 14,
     fontWeight: '600',
     color: COLORS.PRIMARY,
-  },
-  footer: {
-    marginTop: 24,
-    fontSize: 12,
-    color: COLORS.TEXT_SECONDARY,
-    textAlign: 'center',
-    paddingHorizontal: 16,
-  },
-  footerLink: {
-    textDecorationLine: 'underline',
-    color: COLORS.TEXT,
   },
 });
 
